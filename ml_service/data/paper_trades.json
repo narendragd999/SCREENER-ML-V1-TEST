@@ -1,0 +1,22 @@
+[
+  {
+    "id": "ULTRACEMCO-1784564966922",
+    "ticker": "ULTRACEMCO",
+    "action": "BUY",
+    "quantity": 1,
+    "entry_price": 11903.0,
+    "target_price": 12260.09,
+    "stop_loss": 11693.55,
+    "notes": "STRONG_BUY | Conf: 100%",
+    "status": "PENDING",
+    "order_type": "LIMIT",
+    "entry_date": "2026-07-20 21:59",
+    "executed_at": null,
+    "exit_date": null,
+    "exit_price": null,
+    "pnl": null,
+    "pnl_pct": null,
+    "strategy_action": null,
+    "confidence": null
+  }
+]

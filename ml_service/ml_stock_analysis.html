@@ -1,0 +1,1347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TensorFlow ML -- Per-Stock Deep Analysis & 3% Strategy</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      fontFamily: { ui: ['"Exo 2"', 'sans-serif'], mono: ['"JetBrains Mono"', 'monospace'] },
+      colors: {
+        base: '#030912', card: '#0a1628', card2: '#0f1d32', card3: '#131f38',
+        border: '#1a2d4a', border2: '#243a5c',
+        accent: '#00e5a0', accent2: '#00b8d4', warn: '#f59e0b', danger: '#ef4444',
+        ml: '#a78bfa', ml2: '#c084fc', bull: '#22c55e', bear: '#ef4444',
+      }
+    }
+  }
+}
+</script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Exo 2', sans-serif; background: #030912; color: #e2e8f0; min-height: 100vh; }
+.font-mono { font-family: 'JetBrains Mono', monospace; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0a1628; }
+::-webkit-scrollbar-thumb { background: #1a2d4a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #243a5c; }
+.glow { box-shadow: 0 0 20px rgba(0, 229, 160, 0.12); }
+.glow-purple { box-shadow: 0 0 20px rgba(167, 139, 250, 0.12); }
+.glow-red { box-shadow: 0 0 20px rgba(239, 68, 68, 0.12); }
+.pulse-dot { animation: pulse 2s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner { animation: spin 1s linear infinite; border: 3px solid #1a2d4a; border-top-color: #a78bfa; border-radius: 50%; width: 24px; height: 24px; }
+.score-bar { height: 8px; border-radius: 4px; background: #1a2d4a; overflow: hidden; }
+.score-bar-fill { height: 100%; border-radius: 4px; transition: width 0.6s ease; }
+.badge { padding: 3px 10px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.5px; display: inline-block; }
+.badge-strong_buy { background: rgba(34,197,94,0.2); color: #22c55e; border: 1px solid rgba(34,197,94,0.3); }
+.badge-buy { background: rgba(0,184,212,0.2); color: #00b8d4; border: 1px solid rgba(0,184,212,0.3); }
+.badge-watch { background: rgba(245,158,11,0.2); color: #f59e0b; border: 1px solid rgba(245,158,11,0.3); }
+.badge-wait { background: rgba(100,116,139,0.2); color: #94a3b8; border: 1px solid rgba(100,116,139,0.3); }
+.badge-bullish { background: rgba(34,197,94,0.15); color: #22c55e; }
+.badge-bearish { background: rgba(239,68,68,0.15); color: #ef4444; }
+.badge-neutral { background: rgba(148,163,184,0.15); color: #94a3b8; }
+.tab-active { border-bottom: 2px solid #a78bfa; color: #a78bfa; }
+.fade-in { animation: fadeIn 0.3s ease-in; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.strat-step { padding: 8px 12px; background: #0f1d32; border-left: 3px solid #a78bfa; border-radius: 0 8px 8px 0; margin-bottom: 6px; font-size: 0.82rem; }
+select { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2394a3b8' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; }
+</style>
+</head>
+<body class="p-3 md:p-5">
+
+<!-- ????????? TOP BAR ????????? -->
+<div class="flex items-center justify-between mb-5">
+  <div class="flex items-center gap-3">
+    <a href="/" class="text-xs text-gray-500 hover:text-gray-300 transition"><- ML Dashboard</a>
+    <div class="w-px h-5 bg-border"></div>
+    <div>
+      <h1 class="text-xl md:text-2xl font-bold">
+        <span class="text-ml">TensorFlow ML</span> Per-Stock Analysis
+      </h1>
+      <p class="text-xs text-gray-500 mt-0.5">V2 Intelligent Scoring + Multi-Timeframe + Momentum Analysis & 3% target strategy</p>
+    </div>
+  </div>
+  <div class="flex items-center gap-3">
+    <span id="status-dot" class="w-2.5 h-2.5 rounded-full bg-gray-500"></span>
+    <span id="status-text" class="text-xs font-mono text-gray-400">Connecting...</span>
+  </div>
+</div>
+
+<!-- ????????? STOCK SELECTOR BAR ????????? -->
+<div class="bg-card rounded-xl border border-border p-4 mb-5 flex flex-wrap items-center gap-3">
+  <select id="ticker-select" class="bg-card2 border border-border rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none pr-8 min-w-[180px] focus:outline-none focus:border-ml/50">
+    <option value="">-- Select Stock --</option>
+  </select>
+  <input id="ticker-input" type="text" placeholder="Or type ticker (e.g. RELIANCE)"
+    class="bg-card2 border border-border rounded-lg px-3 py-2 text-sm text-gray-200 w-52 focus:outline-none focus:border-ml/50"
+    onkeypress="if(event.key==='Enter')analyzeStock()">
+  <button onclick="analyzeStock()" id="btn-analyze"
+    class="px-5 py-2 bg-ml/20 text-ml border border-ml/30 rounded-lg text-sm font-bold hover:bg-ml/30 transition">
+    Analyze with ML
+  </button>
+  <div class="w-px h-8 bg-border hidden md:block"></div>
+  <button onclick="scanAllStocks()" id="btn-scan"
+    class="px-5 py-2 bg-accent/20 text-accent border border-accent/30 rounded-lg text-sm font-bold hover:bg-accent/30 transition">
+    Scan All F&O Stocks
+  </button>
+  <button onclick="scanAllStocks()" id="btn-scan-loading" class="hidden px-5 py-2 bg-accent/10 text-accent/50 rounded-lg text-sm font-bold cursor-wait">
+    <span class="spinner inline-block w-4 h-4 mr-2 align-middle" style="border-width:2px"></span>Scanning...
+  </button>
+</div>
+
+<!-- ????????? LOADING STATE ????????? -->
+<div id="loading-state" class="hidden text-center py-20">
+  <div class="spinner mx-auto mb-4"></div>
+  <p class="text-ml font-semibold" id="loading-text">Downloading data & running TensorFlow analysis...</p>
+  <p class="text-xs text-gray-500 mt-2">This may take 10-20 seconds for the first request</p>
+</div>
+
+<!-- ????????? ERROR STATE ????????? -->
+<div id="error-state" class="hidden text-center py-20">
+  <div class="text-4xl mb-3">&#9888;&#65039;</div>
+  <p class="text-danger font-semibold" id="error-text">Error loading data</p>
+  <p class="text-xs text-gray-500 mt-2">Check the ticker symbol and try again</p>
+</div>
+
+<!-- ????????? MAIN CONTENT (hidden until data loads) ????????? -->
+<div id="main-content" class="hidden fade-in">
+
+  <!-- ????????? STOCK HEADER ????????? -->
+  <div class="bg-card rounded-xl border border-border p-5 mb-5">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <div class="flex items-center gap-3">
+          <h2 class="text-2xl font-extrabold" id="stock-name">RELIANCE</h2>
+          <span id="strategy-badge" class="badge badge-buy">BUY</span>
+        </div>
+        <div class="flex items-baseline gap-3 mt-2">
+          <span class="text-3xl font-bold font-mono" id="stock-price">--</span>
+          <span class="text-sm font-mono" id="stock-change-1d">--</span>
+          <span class="text-xs text-gray-500" id="stock-data-points">-- bars</span>
+        </div>
+      </div>
+      <div class="flex gap-6 text-center">
+        <div>
+          <div class="text-xs text-gray-500 mb-1">Strategy Confidence</div>
+          <div class="text-2xl font-bold font-mono" id="strat-confidence">--</div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500 mb-1">Risk:Reward</div>
+          <div class="text-2xl font-bold font-mono" id="strat-rr">--</div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500 mb-1">3% Hit Rate</div>
+          <div class="text-2xl font-bold font-mono" id="strat-hitrate">--</div>
+        </div>
+        <div>
+          <div class="text-xs text-gray-500 mb-1">ML Score</div>
+          <div class="text-2xl font-bold font-mono text-ml" id="strat-mlscore">--</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ????????? TABS ????????? -->
+  <div class="flex border-b border-border mb-5 gap-6 text-sm font-semibold overflow-x-auto">
+    <button onclick="switchTab('strategy')" id="tab-strategy" class="pb-3 px-1 tab-active whitespace-nowrap">Strategy & 3% Target</button>
+    <button onclick="switchTab('patterns')" id="tab-patterns" class="pb-3 px-1 text-gray-500 hover:text-gray-300 whitespace-nowrap">Pattern Recognition</button>
+    <button onclick="switchTab('behavior')" id="tab-behavior" class="pb-3 px-1 text-gray-500 hover:text-gray-300 whitespace-nowrap">Behavior Profile</button>
+    <button onclick="switchTab('ml')" id="tab-ml" class="pb-3 px-1 text-gray-500 hover:text-gray-300 whitespace-nowrap">ML Models</button>
+    <button onclick="switchTab('scanner')" id="tab-scanner" class="pb-3 px-1 text-gray-500 hover:text-gray-300 whitespace-nowrap">ML Scanner</button>
+    <button onclick="switchTab('orders')" id="tab-orders" class="pb-3 px-1 text-gray-500 hover:text-gray-300 whitespace-nowrap">Orders</button>
+  </div>
+
+  <!-- ????????? TAB: STRATEGY & 3% TARGET ????????? -->
+  <div id="panel-strategy" class="fade-in">
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
+
+      <!-- Strategy Card -->
+      <div class="lg:col-span-2 bg-card rounded-xl border border-border p-5">
+        <h3 class="text-sm font-bold text-ml mb-4 flex items-center gap-2">
+          <span>3% TARGET STRATEGY</span>
+          <span class="text-[0.6rem] bg-ml/20 text-ml px-2 py-0.5 rounded">ML-ENHANCED</span>
+        </h3>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+          <div class="bg-card2 rounded-lg p-3">
+            <div class="text-xs text-gray-500">Entry Price</div>
+            <div class="font-bold font-mono mt-1 text-lg" id="s-entry">--</div>
+            <div class="text-[0.65rem] text-gray-500 mt-1" id="s-entry-type">--</div>
+          </div>
+          <div class="bg-card2 rounded-lg p-3">
+            <div class="text-xs text-gray-500">Stop Loss</div>
+            <div class="font-bold font-mono mt-1 text-lg text-danger" id="s-sl">--</div>
+            <div class="text-[0.65rem] text-gray-500 mt-1" id="s-sl-pct">--</div>
+          </div>
+          <div class="bg-card2 rounded-lg p-3">
+            <div class="text-xs text-gray-500">Target (3%)</div>
+            <div class="font-bold font-mono mt-1 text-lg text-bull" id="s-target">--</div>
+            <div class="text-[0.65rem] text-gray-500 mt-1" id="s-target-type">--</div>
+          </div>
+          <div class="bg-card2 rounded-lg p-3">
+            <div class="text-xs text-gray-500">Position Size</div>
+            <div class="font-bold font-mono mt-1 text-sm" id="s-position">--</div>
+          </div>
+        </div>
+        <div id="s-steps" class="space-y-1.5"></div>
+      </div>
+
+      <!-- Price Summary + Indicators -->
+      <div class="space-y-5">
+        <!-- Price Changes -->
+        <div class="bg-card rounded-xl border border-border p-4">
+          <h3 class="text-sm font-bold mb-3">Price Changes</h3>
+          <div class="space-y-2">
+            <div class="flex justify-between text-sm">
+              <span class="text-gray-500">1D</span>
+              <span class="font-mono" id="ch-1d">--</span>
+            </div>
+            <div class="flex justify-between text-sm">
+              <span class="text-gray-500">5D</span>
+              <span class="font-mono" id="ch-5d">--</span>
+            </div>
+            <div class="flex justify-between text-sm">
+              <span class="text-gray-500">20D</span>
+              <span class="font-mono" id="ch-20d">--</span>
+            </div>
+            <div class="flex justify-between text-sm">
+              <span class="text-gray-500">60D</span>
+              <span class="font-mono" id="ch-60d">--</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Key Indicators -->
+        <div class="bg-card rounded-xl border border-border p-4">
+          <h3 class="text-sm font-bold mb-3">Key Indicators</h3>
+          <div class="space-y-2 text-sm" id="indicators-list">
+            <div class="text-gray-500 text-xs">Loading...</div>
+          </div>
+        </div>
+
+        <!-- Volume -->
+        <div class="bg-card rounded-xl border border-border p-4">
+          <h3 class="text-sm font-bold mb-3">Volume</h3>
+          <div class="text-sm" id="volume-info">
+            <div class="text-gray-500 text-xs">Loading...</div>
+          </div>
+        </div>
+        <!-- Fair Value -->
+        <div class="bg-card rounded-xl border border-border p-4">
+          <h3 class="text-sm font-bold mb-3">Fair Value</h3>
+          <div class="text-sm" id="fair-value-info">
+            <div class="text-gray-500 text-xs">Loading...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Strategy Reasons -->
+    <div class="bg-card rounded-xl border border-border p-5 mb-5">
+      <h3 class="text-sm font-bold mb-3">Strategy Reasons</h3>
+      <div class="flex flex-wrap gap-2" id="s-reasons"></div>
+    </div>
+
+    <!-- V2: Intelligent Scoring Breakdown, Multi-Timeframe, Momentum -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-5 mb-5">
+      <div class="bg-card rounded-xl border border-ml/30 p-4 glow-purple">
+        <h3 class="text-sm font-bold text-ml mb-3">V2 Signal Quality Breakdown</h3>
+        <div id="scoring-breakdown" class="text-xs text-gray-500">Analyzing...</div>
+      </div>
+      <div class="bg-card rounded-xl border border-border p-4">
+        <h3 class="text-sm font-bold mb-3">Multi-Timeframe Alignment</h3>
+        <div id="mtf-info" class="text-xs text-gray-500">Analyzing...</div>
+      </div>
+      <div class="bg-card rounded-xl border border-border p-4">
+        <h3 class="text-sm font-bold mb-3">Momentum Acceleration</h3>
+        <div id="mom-info" class="text-xs text-gray-500">Analyzing...</div>
+      </div>
+    </div>
+
+    <!-- Support & Resistance -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-5 mb-5">
+      <div class="bg-card rounded-xl border border-border p-4">
+        <h3 class="text-sm font-bold text-bull mb-3">Support Levels</h3>
+        <div id="sr-supports" class="space-y-2">
+          <div class="text-xs text-gray-500">Loading...</div>
+        </div>
+      </div>
+      <div class="bg-card rounded-xl border border-border p-4">
+        <h3 class="text-sm font-bold text-danger mb-3">Resistance Levels</h3>
+        <div id="sr-resistances" class="space-y-2">
+          <div class="text-xs text-gray-500">Loading...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ????????? TAB: PATTERN RECOGNITION ????????? -->
+  <div id="panel-patterns" class="hidden fade-in">
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+      <!-- Candlestick Patterns -->
+      <div class="bg-card rounded-xl border border-border p-5">
+        <h3 class="text-sm font-bold text-accent2 mb-3">Candlestick Patterns (Last 30 Bars)</h3>
+        <div id="candle-patterns" class="space-y-2">
+          <div class="text-xs text-gray-500">Loading...</div>
+        </div>
+      </div>
+      <!-- Chart Patterns -->
+      <div class="bg-card rounded-xl border border-border p-5">
+        <h3 class="text-sm font-bold text-ml mb-3">Chart Patterns (Swing Analysis)</h3>
+        <div id="chart-patterns" class="space-y-2">
+          <div class="text-xs text-gray-500">Loading...</div>
+        </div>
+      </div>
+    </div>
+    <div class="bg-card rounded-xl border border-border p-5 mt-5">
+      <h3 class="text-sm font-bold mb-3">Pattern Summary</h3>
+      <div class="grid grid-cols-3 gap-4 text-center" id="pattern-summary">
+        <div class="bg-card2 rounded-lg p-3">
+          <div class="text-2xl font-bold text-bull" id="pat-bull-count">0</div>
+          <div class="text-xs text-gray-500">Bullish</div>
+        </div>
+        <div class="bg-card2 rounded-lg p-3">
+          <div class="text-2xl font-bold text-bear" id="pat-bear-count">0</div>
+          <div class="text-xs text-gray-500">Bearish</div>
+        </div>
+        <div class="bg-card2 rounded-lg p-3">
+          <div class="text-2xl font-bold text-gray-400" id="pat-neutral-count">0</div>
+          <div class="text-xs text-gray-500">Neutral</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ????????? TAB: BEHAVIOR PROFILE ????????? -->
+  <div id="panel-behavior" class="hidden fade-in">
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5">
+      <!-- Volatility -->
+      <div class="bg-card rounded-xl border border-border p-5">
+        <h3 class="text-sm font-bold text-warn mb-4">Volatility Regime</h3>
+        <div class="text-center mb-4">
+          <div class="text-3xl font-extrabold" id="bp-vol-regime">--</div>
+          <div class="text-sm text-gray-500 mt-1" id="bp-vol-ann">Annualized: --</div>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div class="bg-card2 rounded-lg p-3 text-center">
+            <div class="text-xs text-gray-500">Daily Std</div>
+            <div class="font-mono font-bold mt-1" id="bp-daily-std">--</div>
+          </div>
+          <div class="bg-card2 rounded-lg p-3 text-center">
+            <div class="text-xs text-gray-500">Avg Daily Move</div>
+            <div class="font-mono font-bold mt-1" id="bp-avg-daily">--</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Behavior Type -->
+      <div class="bg-card rounded-xl border border-border p-5">
+        <h3 class="text-sm font-bold text-accent2 mb-4">Behavior Type</h3>
+        <div class="text-center mb-4">
+          <div class="text-3xl font-extrabold" id="bp-beh-type">--</div>
+          <div class="text-sm text-gray-500 mt-1" id="bp-beh-desc">--</div>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div class="bg-card2 rounded-lg p-3 text-center">
+            <div class="text-xs text-gray-500">Autocorrelation</div>
+            <div class="font-mono font-bold mt-1" id="bp-autocorr">--</div>
+          </div>
+          <div class="bg-card2 rounded-lg p-3 text-center">
+            <div class="text-xs text-gray-500">Avg Weekly Move</div>
+            <div class="font-mono font-bold mt-1" id="bp-avg-weekly">--</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5">
+      <!-- 3% Hit Rate -->
+      <div class="bg-card rounded-xl border border-border p-5">
+        <h3 class="text-sm font-bold text-bull mb-4">Historical 3% Hit Rate</h3>
+        <div class="text-center mb-4">
+          <div class="text-5xl font-extrabold font-mono" id="bp-hitrate">--</div>
+          <div class="text-sm text-gray-500 mt-1" id="bp-hitrate-detail">-- windows analyzed</div>
+        </div>
+        <div class="bg-card2 rounded-lg p-3 text-center" id="bp-avg-days">
+          <span class="text-xs text-gray-500">Avg days to hit 3%: --</span>
+        </div>
+      </div>
+
+      <!-- Gaps & Streaks -->
+      <div class="bg-card rounded-xl border border-border p-5">
+        <h3 class="text-sm font-bold text-ml mb-4">Gaps & Streaks</h3>
+        <div class="space-y-3">
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-gray-400">Gap Up Frequency</span>
+            <span class="font-mono text-sm font-bold text-bull" id="bp-gap-up">--</span>
+          </div>
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-gray-400">Gap Down Frequency</span>
+            <span class="font-mono text-sm font-bold text-bear" id="bp-gap-down">--</span>
+          </div>
+          <div class="border-t border-border pt-3"></div>
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-gray-400">Max Up Streak</span>
+            <span class="font-mono text-sm font-bold text-bull" id="bp-up-streak">--</span>
+          </div>
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-gray-400">Max Down Streak</span>
+            <span class="font-mono text-sm font-bold text-bear" id="bp-down-streak">--</span>
+          </div>
+          <div class="flex justify-between items-center">
+            <span class="text-sm text-gray-400">Current Streak</span>
+            <span class="font-mono text-sm font-bold" id="bp-curr-streak">--</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Seasonality -->
+    <div class="bg-card rounded-xl border border-border p-5">
+      <h3 class="text-sm font-bold text-warn mb-4">Seasonality (Day of Week)</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="bg-card2 rounded-lg p-3 text-center">
+          <div class="text-xs text-gray-500">Best Day</div>
+          <div class="font-bold mt-1 text-bull" id="bp-best-day">--</div>
+          <div class="text-xs font-mono text-gray-400 mt-1" id="bp-best-day-avg">--</div>
+        </div>
+        <div class="bg-card2 rounded-lg p-3 text-center">
+          <div class="text-xs text-gray-500">Worst Day</div>
+          <div class="font-bold mt-1 text-bear" id="bp-worst-day">--</div>
+          <div class="text-xs font-mono text-gray-400 mt-1" id="bp-worst-day-avg">--</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ????????? TAB: ML MODELS ????????? -->
+  <div id="panel-ml" class="hidden fade-in">
+    <div class="bg-card rounded-xl border border-border p-5 mb-5">
+      <h3 class="text-sm font-bold text-ml mb-4">TensorFlow Model Predictions</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
+        <div class="bg-card2 rounded-lg p-4 text-center">
+          <div class="text-xs text-gray-500 mb-1">Signal Quality</div>
+          <div class="text-2xl font-bold font-mono" id="ml-sq">--</div>
+          <div class="score-bar mt-2"><div class="score-bar-fill bg-accent" id="ml-sq-bar" style="width:0%"></div></div>
+        </div>
+        <div class="bg-card2 rounded-lg p-4 text-center">
+          <div class="text-xs text-gray-500 mb-1">Trend Regime</div>
+          <div class="text-xl font-bold mt-1" id="ml-regime">--</div>
+          <div class="text-xs text-gray-500 mt-1" id="ml-regime-conf">Confidence: --</div>
+        </div>
+        <div class="bg-card2 rounded-lg p-4 text-center">
+          <div class="text-xs text-gray-500 mb-1">Expected Return</div>
+          <div class="text-2xl font-bold font-mono" id="ml-eret">--</div>
+        </div>
+        <div class="bg-card2 rounded-lg p-4 text-center">
+          <div class="text-xs text-gray-500 mb-1">Max Drawdown</div>
+          <div class="text-2xl font-bold font-mono text-danger" id="ml-dd">--</div>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="bg-card2 rounded-lg p-3 text-center">
+          <div class="text-xs text-gray-500">ML Score</div>
+          <div class="font-mono font-bold mt-1 text-ml" id="ml-score">--</div>
+        </div>
+        <div class="bg-card2 rounded-lg p-3 text-center">
+          <div class="text-xs text-gray-500">Actionable</div>
+          <div class="font-bold mt-1" id="ml-action">--</div>
+        </div>
+        <div class="bg-card2 rounded-lg p-3 text-center">
+          <div class="text-xs text-gray-500">Regime Probabilities</div>
+          <div class="text-xs font-mono mt-1" id="ml-regime-probs">--</div>
+        </div>
+        <div class="bg-card2 rounded-lg p-3 text-center">
+          <div class="text-xs text-gray-500">R:R Ratio</div>
+          <div class="font-mono font-bold mt-1" id="ml-rr">--</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ????????? TAB: ML SCANNER ????????? -->
+  <div id="panel-scanner" class="hidden fade-in">
+    <div class="bg-card rounded-xl border border-border p-4 mb-4">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h3 class="text-sm font-bold">ML-Powered 3% Target Scanner</h3>
+          <p class="text-xs text-gray-500 mt-0.5">Like your Chartink screener but powered by TensorFlow -- scans all F&O stocks</p>
+        </div>
+        <div class="flex gap-2">
+          <button onclick="filterScan('ALL')" class="text-xs px-2 py-1 rounded bg-border/50 hover:bg-border transition">ALL</button>
+          <button onclick="filterScan('STRONG_BUY')" class="text-xs px-2 py-1 rounded bg-bull/20 text-bull hover:bg-bull/30 transition">STRONG BUY</button>
+          <button onclick="filterScan('BUY')" class="text-xs px-2 py-1 rounded bg-accent2/20 text-accent2 hover:bg-accent2/30 transition">BUY</button>
+          <button onclick="filterScan('WATCH')" class="text-xs px-2 py-1 rounded bg-warn/20 text-warn hover:bg-warn/30 transition">WATCH</button>
+          <button onclick="filterScan('WAIT')" class="text-xs px-2 py-1 rounded bg-gray-500/20 text-gray-400 hover:bg-gray-500/30 transition">WAIT</button>
+        </div>
+      </div>
+    </div>
+    <!-- Scanner Stats -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4" id="scan-stats">
+      <div class="bg-card rounded-lg border border-border p-3 text-center">
+        <div class="text-xs text-gray-500">Strong Buys</div>
+        <div class="text-xl font-bold text-bull font-mono" id="scan-sb">--</div>
+      </div>
+      <div class="bg-card rounded-lg border border-border p-3 text-center">
+        <div class="text-xs text-gray-500">Buys</div>
+        <div class="text-xl font-bold text-accent2 font-mono" id="scan-buy">--</div>
+      </div>
+      <div class="bg-card rounded-lg border border-border p-3 text-center">
+        <div class="text-xs text-gray-500">Watch</div>
+        <div class="text-xl font-bold text-warn font-mono" id="scan-watch">--</div>
+      </div>
+      <div class="bg-card rounded-lg border border-border p-3 text-center">
+        <div class="text-xs text-gray-500">Wait</div>
+        <div class="text-xl font-bold text-gray-400 font-mono" id="scan-wait">--</div>
+      </div>
+    </div>
+    <!-- Scanner Table -->
+    <div class="bg-card rounded-xl border border-border overflow-hidden">
+      <div class="overflow-x-auto max-h-[600px] overflow-y-auto">
+        <table class="w-full text-sm">
+          <thead class="bg-card2 sticky top-0 z-10">
+            <tr class="text-xs text-gray-500 uppercase tracking-wider">
+              <th class="px-3 py-2 text-left">Action</th>
+              <th class="px-3 py-2 text-left">Ticker</th>
+              <th class="px-3 py-2 text-right">Price</th>
+              <th class="px-3 py-2 text-right">Conf%</th>
+              <th class="px-3 py-2 text-right">SigQ%</th>
+              <th class="px-3 py-2 text-right">R:R</th>
+              <th class="px-3 py-2 text-right">3% Hit%</th>
+              <th class="px-3 py-2 text-left">Regime</th>
+              <th class="px-3 py-2 text-left">Behavior</th>
+              <th class="px-3 py-2 text-right">Exp Ret%</th>
+              <th class="px-3 py-2 text-right">RSI</th>
+              <th class="px-3 py-2 text-right">Vol%</th>
+              <th class="px-3 py-2 text-left">Entry</th>
+              <th class="px-3 py-2 text-left">Target</th>
+              <th class="px-3 py-2 text-left">Stop Loss</th>
+              <th class="px-3 py-2 text-left">Size</th>
+              <th class="px-3 py-2 text-left">Top Reason</th>
+            </tr>
+          </thead>
+          <tbody id="scan-tbody">
+            <tr><td colspan="17" class="px-3 py-12 text-center text-gray-500">Click "Scan All F&O Stocks" to run the ML scanner</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="text-center mt-3">
+      <p class="text-xs text-gray-500" id="scan-footer">--</p>
+    </div>
+  </div>
+
+
+  <!-- TAB: PAPER TRADING ORDERS -->
+  <div id="panel-orders" class="hidden fade-in">
+    <!-- Portfolio Summary -->
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-5">
+      <div class="bg-card rounded-lg border border-border p-3 text-center">
+        <div class="text-xs text-gray-500">Total P&L</div>
+        <div class="text-xl font-bold font-mono" id="ord-total-pnl">Rs.0</div>
+      </div>
+      <div class="bg-card rounded-lg border border-border p-3 text-center">
+        <div class="text-xs text-gray-500">Win Rate</div>
+        <div class="text-xl font-bold font-mono" id="ord-win-rate">0%</div>
+      </div>
+      <div class="bg-card rounded-lg border border-border p-3 text-center">
+        <div class="text-xs text-gray-500">Open</div>
+        <div class="text-xl font-bold font-mono text-warn" id="ord-open">0</div>
+      </div>
+      <div class="bg-card rounded-lg border border-border p-3 text-center">
+        <div class="text-xs text-gray-500">Closed</div>
+        <div class="text-xl font-bold font-mono" id="ord-closed">0</div>
+      </div>
+      <div class="bg-card rounded-lg border border-border p-3 text-center">
+        <div class="text-xs text-gray-500">Stocks</div>
+        <div class="text-xl font-bold font-mono text-ml" id="ord-stocks">0</div>
+      </div>
+    </div>
+
+    <!-- Filters -->
+    <div class="bg-card rounded-xl border border-border p-3 mb-4">
+      <div class="flex flex-wrap items-center gap-3">
+        <input type="text" id="ord-filter-ticker" placeholder="Filter by ticker..." 
+          class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm w-40 focus:border-accent outline-none" 
+          oninput="loadOrders()">
+        <select id="ord-filter-status" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm focus:border-accent outline-none" onchange="loadOrders()">
+          <option value="">All Status</option>
+          <option value="OPEN">Open</option>
+          <option value="CLOSED">Closed</option>
+          <option value="CANCELLED">Cancelled</option>
+        </select>
+        <button id="btn-add-order" onclick="openAddOrderModal()" class="ml-auto px-4 py-1.5 bg-accent/20 text-accent border border-accent/30 rounded-lg text-sm font-bold hover:bg-accent/30 transition">+ New Order</button>
+        <button onclick="loadOrders()" class="px-3 py-1.5 bg-border/50 hover:bg-border rounded-lg text-sm transition">Refresh</button>
+      </div>
+    </div>
+
+    <!-- Stock-wise Ticker Cards -->
+    <div id="ord-ticker-cards" class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4"></div>
+
+    <!-- Orders Table -->
+    <div class="bg-card rounded-xl border border-border overflow-hidden">
+      <div class="overflow-x-auto max-h-[500px] overflow-y-auto">
+        <table class="w-full text-sm">
+          <thead class="bg-card2 sticky top-0 z-10">
+            <tr class="text-xs text-gray-500 uppercase tracking-wider">
+              <th class="px-3 py-2 text-left">Date</th>
+              <th class="px-3 py-2 text-left">Ticker</th>
+              <th class="px-3 py-2 text-left">Action</th>
+              <th class="px-3 py-2 text-right">Qty</th>
+              <th class="px-3 py-2 text-right">Entry</th>
+              <th class="px-3 py-2 text-right">Target</th>
+              <th class="px-3 py-2 text-right">Stop Loss</th>
+              <th class="px-3 py-2 text-right">Exit</th>
+              <th class="px-3 py-2 text-right">P&L</th>
+              <th class="px-3 py-2 text-left">Status</th>
+              <th class="px-3 py-2 text-left">Notes</th>
+              <th class="px-3 py-2 text-center">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="ord-tbody">
+            <tr><td colspan="12" class="px-3 py-12 text-center text-gray-500">Loading orders...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ADD ORDER MODAL -->
+  <div id="order-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-card border border-border rounded-2xl p-6 w-full max-w-md shadow-2xl">
+      <div class="flex justify-between items-center mb-5">
+        <h3 class="text-lg font-bold text-accent">Add Paper Trade Order</h3>
+        <button onclick="closeOrderModal()" class="text-gray-500 hover:text-white text-xl">&times;</button>
+      </div>
+      <div class="space-y-4">
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Ticker</label>
+          <input type="text" id="ord-ticker" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm font-mono focus:border-accent outline-none" placeholder="e.g. RELIANCE">
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Action</label>
+            <select id="ord-action" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm focus:border-accent outline-none">
+              <option value="BUY">BUY</option>
+              <option value="SELL">SELL</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Quantity</label>
+            <input type="number" id="ord-qty" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm font-mono focus:border-accent outline-none" value="1" min="1">
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Entry Price (Rs.)</label>
+          <input type="number" id="ord-price" step="0.01" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm font-mono focus:border-accent outline-none" placeholder="0.00">
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Target Price (Rs.)</label>
+            <input type="number" id="ord-target" step="0.01" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm font-mono focus:border-accent outline-none" placeholder="Optional">
+          </div>
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Stop Loss (Rs.)</label>
+            <input type="number" id="ord-sl" step="0.01" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm font-mono focus:border-accent outline-none" placeholder="Optional">
+          </div>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Notes</label>
+          <input type="text" id="ord-notes" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm focus:border-accent outline-none" placeholder="Optional notes...">
+        </div>
+        <div class="flex gap-3 pt-2">
+          <button onclick="submitOrder()" class="flex-1 py-2.5 bg-accent text-base font-bold rounded-lg hover:bg-accent/80 transition">Add Order</button>
+          <button onclick="closeOrderModal()" class="px-5 py-2.5 bg-border/50 rounded-lg hover:bg-border transition text-sm">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Close Order Modal -->
+  <div id="close-order-modal" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-card border border-border rounded-2xl p-6 w-full max-w-sm shadow-2xl">
+      <h3 class="text-lg font-bold mb-4">Close Order</h3>
+      <input type="hidden" id="close-ord-id">
+      <div class="space-y-3">
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Exit Price (Rs.)</label>
+          <input type="number" id="close-ord-price" step="0.01" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm font-mono focus:border-accent outline-none" placeholder="0.00">
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Status</label>
+          <select id="close-ord-status" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm focus:border-accent outline-none">
+            <option value="CLOSED">Closed (Realized P&L)</option>
+            <option value="CANCELLED">Cancelled</option>
+          </select>
+        </div>
+        <div class="flex gap-3 pt-2">
+          <button onclick="submitCloseOrder()" class="flex-1 py-2.5 bg-accent text-base font-bold rounded-lg hover:bg-accent/80 transition">Confirm</button>
+          <button onclick="closeCloseModal()" class="px-5 py-2.5 bg-border/50 rounded-lg hover:bg-border transition text-sm">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const API = 'http://localhost:8001';
+let currentReport = null;
+let scanResults = [];
+let scanFilter = 'ALL';
+
+// ????????? API HELPER ?????????
+async function api(endpoint, opts = {}) {
+  try {
+    const resp = await fetch(API + endpoint, opts);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || resp.statusText);
+    }
+    return await resp.json();
+  } catch (e) {
+    console.error('API error:', endpoint, e);
+    throw e;
+  }
+}
+
+// ????????? STATUS ?????????
+async function checkHealth() {
+  try {
+    const data = await api('/api/health');
+    document.getElementById('status-dot').className = 'w-2.5 h-2.5 rounded-full bg-accent pulse-dot';
+    const mode = data.scoring_mode === 'intelligent_scoring_fallback' ? 'Connected (Intelligent Scoring)' : 'Connected (TF ML)';
+    document.getElementById('status-text').textContent = mode;
+    document.getElementById('status-text').className = 'text-xs font-mono text-accent';
+  } catch {
+    document.getElementById('status-dot').className = 'w-2.5 h-2.5 rounded-full bg-danger';
+    document.getElementById('status-text').textContent = 'Disconnected';
+    document.getElementById('status-text').className = 'text-xs font-mono text-danger';
+  }
+}
+
+// ????????? LOAD TICKERS ?????????
+async function loadTickers() {
+  try {
+    const data = await api('/api/available-tickers');
+    const sel = document.getElementById('ticker-select');
+    data.tickers.forEach(t => {
+      const opt = document.createElement('option');
+      opt.value = t;
+      opt.textContent = t;
+      sel.appendChild(opt);
+    });
+  } catch (e) {
+    console.error('Failed to load tickers:', e);
+  }
+}
+
+// ????????? ANALYZE SINGLE STOCK ?????????
+async function analyzeStock() {
+  const selVal = document.getElementById('ticker-select').value;
+  const inputVal = document.getElementById('ticker-input').value.trim().toUpperCase();
+  const ticker = inputVal || selVal;
+  if (!ticker) return;
+
+  // Show loading
+  document.getElementById('loading-state').classList.remove('hidden');
+  document.getElementById('error-state').classList.add('hidden');
+  document.getElementById('main-content').classList.add('hidden');
+  document.getElementById('loading-text').textContent = `Downloading ${ticker} data & running TensorFlow analysis...`;
+
+  try {
+    const report = await api(`/api/stock-analysis/${ticker}`);
+    currentReport = report;
+    renderReport(report);
+    document.getElementById('loading-state').classList.add('hidden');
+    document.getElementById('main-content').classList.remove('hidden');
+    // Also load this stock into the selector if not already
+    const sel = document.getElementById('ticker-select');
+    if (![...sel.options].some(o => o.value === ticker)) {
+      const opt = document.createElement('option');
+      opt.value = ticker;
+      opt.textContent = ticker;
+      sel.appendChild(opt);
+      sel.value = ticker;
+    }
+  } catch (e) {
+    document.getElementById('loading-state').classList.add('hidden');
+    document.getElementById('error-state').classList.remove('hidden');
+    document.getElementById('error-text').textContent = e.message || 'Failed to analyze stock';
+  }
+}
+
+// ????????? RENDER FULL REPORT ?????????
+function renderReport(r) {
+  // Header
+  document.getElementById('stock-name').textContent = r.ticker;
+  document.getElementById('stock-price').textContent = 'Rs.' + r.price_summary.current.toLocaleString();
+  const ch1d = r.price_summary.change_1d_pct;
+  document.getElementById('stock-change-1d').textContent = (ch1d >= 0 ? '+' : '') + ch1d + '%';
+  document.getElementById('stock-change-1d').className = `text-sm font-mono ${ch1d >= 0 ? 'text-bull' : 'text-bear'}`;
+  document.getElementById('stock-data-points').textContent = r.data_points + ' bars analyzed';
+
+  // Strategy badge
+  const badge = document.getElementById('strategy-badge');
+  badge.textContent = r.strategy.strategy_action.replace('_', ' ');
+  badge.className = `badge badge-${r.strategy.strategy_action.toLowerCase()}`;
+
+  // Header stats
+  document.getElementById('strat-confidence').textContent = r.strategy.confidence + '%';
+  document.getElementById('strat-rr').textContent = r.strategy.risk_reward + 'x';
+  document.getElementById('strat-hitrate').textContent = (r.behavior_profile.target_3pct?.hit_rate_pct || 0) + '%';
+  document.getElementById('strat-mlscore').textContent = r.ml_prediction?.ml_score || '--';
+
+  // Strategy details
+  document.getElementById('s-entry').textContent = 'Rs.' + r.strategy.entry.price.toLocaleString();
+  document.getElementById('s-entry-type').textContent = r.strategy.entry.type;
+  document.getElementById('s-sl').textContent = 'Rs.' + r.strategy.stop_loss.price.toLocaleString();
+  document.getElementById('s-sl-pct').textContent = r.strategy.stop_loss.pct + '% from entry';
+  document.getElementById('s-target').textContent = 'Rs.' + r.strategy.target.price.toLocaleString();
+  document.getElementById('s-target-type').textContent = r.strategy.target.type;
+  document.getElementById('s-position').textContent = r.strategy.position_size;
+
+  // Steps
+  document.getElementById('s-steps').innerHTML = r.strategy.steps.map(s =>
+    `<div class="strat-step">${s}</div>`
+  ).join('');
+
+  // Reasons (V2: uses sentiment tags from backend)
+  document.getElementById('s-reasons').innerHTML = r.strategy.reasons.map(reason => {
+    // V2: reason is now {text, sentiment, impact} - use sentiment for color
+    let text, sentiment;
+    if (typeof reason === 'object' && reason.text) {
+      text = reason.text;
+      sentiment = reason.sentiment || 'neutral';
+    } else {
+      // Fallback for old format (plain string)
+      text = reason;
+      sentiment = (text.includes('WARNING') || text.includes('avoid') || text.includes('Weak') || text.includes('risky') || text.includes('penalty')) ? 'negative' : (text.includes('ML predicts severe') ? 'negative' : 'positive');
+    }
+    const cls = sentiment === 'positive' ? 'bg-bull/10 text-bull border border-bull/20'
+               : sentiment === 'negative' ? 'bg-danger/10 text-danger border border-danger/20'
+               : 'bg-gray-500/10 text-gray-400 border border-gray-500/20';
+    return `<span class="text-xs px-2 py-1 rounded ${cls}">${text}</span>`;
+  }).join('');
+
+  // V2: Show scoring breakdown if available
+  const strategy = r.strategy;
+  const scoringEl = document.getElementById('scoring-breakdown');
+  if (scoringEl && strategy.score_components && Object.keys(strategy.score_components).length > 0) {
+    const comp = strategy.score_components;
+    const compNames = {
+      ema_alignment: 'EMA Alignment', rsi_position: 'RSI Position', macd_momentum: 'MACD Momentum',
+      volume_confirmation: 'Volume Confirmation', price_position: 'Price Position (BB)',
+      momentum: 'Momentum', trend_strength: 'Trend Strength', pullback_quality: 'Pullback Quality',
+      recent_performance: 'Recent Performance', volatility_fit: 'Volatility Fit'
+    };
+    scoringEl.innerHTML = Object.entries(comp).map(([k, v]) => {
+      const pct = v * 10;
+      const color = v >= 7 ? 'bg-bull' : v >= 4 ? 'bg-warn' : 'bg-danger';
+      return `<div class="flex items-center gap-2 mb-1.5">
+        <span class="text-xs text-gray-400 w-32 flex-shrink-0">${compNames[k] || k}</span>
+        <div class="flex-1 score-bar"><div class="score-bar-fill ${color}" style="width:${pct}%"></div></div>
+        <span class="text-xs font-mono w-8 text-right">${v}</span>
+      </div>`;
+    }).join('');
+  }
+
+  // V2: Multi-timeframe alignment
+  const mtfEl = document.getElementById('mtf-info');
+  if (mtfEl && strategy.multi_timeframe && strategy.multi_timeframe.alignment) {
+    const mtf = strategy.multi_timeframe;
+    const mtfColor = mtf.score >= 2 ? 'text-bull' : mtf.score <= -1 ? 'text-bear' : 'text-warn';
+    mtfEl.innerHTML = `<div class="text-sm font-bold ${mtfColor}">${mtf.alignment}</div>
+      <div class="text-xs text-gray-500">Weekly: ${mtf.weekly_regime || '--'} | Daily: ${mtf.daily_regime || '--'}</div>`;
+  }
+
+  // V2: Momentum acceleration
+  const momEl = document.getElementById('mom-info');
+  if (momEl && strategy.momentum_acceleration && strategy.momentum_acceleration.acceleration) {
+    const mom = strategy.momentum_acceleration;
+    const momColor = mom.score >= 2 ? 'text-bull' : mom.score <= -1 ? 'text-bear' : 'text-warn';
+    momEl.innerHTML = `<div class="text-sm font-bold ${momColor}">${mom.acceleration}</div>
+      <div class="text-xs text-gray-500">3D: ${mom.ret_3d >= 0 ? '+' : ''}${mom.ret_3d}% | 5D: ${mom.ret_5d >= 0 ? '+' : ''}${mom.ret_5d}% | 10D: ${mom.ret_10d >= 0 ? '+' : ''}${mom.ret_10d}%</div>`;
+  }
+
+  // Price changes
+  ['1d', '5d', '20d', '60d'].forEach(p => {
+    const val = r.price_summary[`change_${p}_pct`];
+    const el = document.getElementById(`ch-${p}`);
+    el.textContent = (val >= 0 ? '+' : '') + val + '%';
+    el.className = `font-mono ${val >= 0 ? 'text-bull' : 'text-bear'}`;
+  });
+
+  // Indicators
+  const ind = r.indicators || {};
+  document.getElementById('indicators-list').innerHTML = [
+    ind.ema9 ? `<div class="flex justify-between"><span class="text-gray-400">EMA 9</span><span class="font-mono">Rs.${ind.ema9}</span></div>` : '',
+    ind.ema21 ? `<div class="flex justify-between"><span class="text-gray-400">EMA 21</span><span class="font-mono">Rs.${ind.ema21}</span></div>` : '',
+    ind.ema50 ? `<div class="flex justify-between"><span class="text-gray-400">EMA 50</span><span class="font-mono">Rs.${ind.ema50}</span></div>` : '',
+    ind.ema9_signal ? `<div class="flex justify-between"><span class="text-gray-400">EMA 9 Signal</span><span class="${ind.ema9_signal === 'BULLISH' ? 'text-bull' : 'text-bear'} font-bold">${ind.ema9_signal}</span></div>` : '',
+    ind.rsi_14 !== undefined ? `<div class="flex justify-between"><span class="text-gray-400">RSI (14)</span><span class="font-mono">${ind.rsi_14} <span class="${ind.rsi_signal === 'OVERBOUGHT' ? 'text-danger' : ind.rsi_signal === 'OVERSOLD' ? 'text-bull' : 'text-gray-400'}">(${ind.rsi_signal})</span></span></div>` : '',
+    ind.macd !== undefined ? `<div class="flex justify-between"><span class="text-gray-400">MACD</span><span class="font-mono ${ind.macd_signal === 'BULLISH' ? 'text-bull' : 'text-bear'}">${ind.macd} (${ind.macd_signal})</span></div>` : '',
+    ind.bb_position_pct !== undefined ? `<div class="flex justify-between"><span class="text-gray-400">BB Position</span><span class="font-mono">${ind.bb_position_pct}%</span></div>` : '',
+    ind.bb_signal ? `<div class="flex justify-between"><span class="text-gray-400">BB Signal</span><span class="text-xs">${ind.bb_signal}</span></div>` : '',
+  ].filter(Boolean).join('') || '<div class="text-xs text-gray-500">No indicators available</div>';
+
+  // Volume
+  const va = r.volume_analysis || {};
+  document.getElementById('volume-info').innerHTML = va.current ?
+    `<div class="flex justify-between text-sm mb-1"><span class="text-gray-400">Current</span><span class="font-mono">${(va.current/1e6).toFixed(1)}M</span></div>
+     <div class="flex justify-between text-sm mb-1"><span class="text-gray-400">20D Avg</span><span class="font-mono">${(va.avg_20d/1e6).toFixed(1)}M</span></div>
+     <div class="flex justify-between text-sm"><span class="text-gray-400">Ratio</span><span class="font-mono font-bold ${va.ratio > 1.5 ? 'text-accent' : va.ratio < 0.5 ? 'text-warn' : ''}">${va.ratio}x <span class="text-xs">(${va.signal})</span></span></div>`
+    : '<div class="text-xs text-gray-500">No volume data</div>';
+
+  // Support / Resistance
+  const sr = r.support_resistance || {};
+  document.getElementById('sr-supports').innerHTML = (sr.supports || []).map(s =>
+    `<div class="flex items-center justify-between bg-card2 rounded-lg p-2">
+       <div>
+         <span class="font-mono font-bold">Rs.${s.price.toLocaleString()}</span>
+         <span class="text-xs text-gray-500 ml-2">${s.distance_pct}% below</span>
+       </div>
+       <div class="flex items-center gap-2">
+         <span class="text-xs text-gray-500">${s.touches} touches</span>
+         <div class="w-16 score-bar"><div class="score-bar-fill bg-bull" style="width:${s.strength * 100}%"></div></div>
+       </div>
+     </div>`
+  ).join('') || '<div class="text-xs text-gray-500">No support levels detected</div>';
+
+  document.getElementById('sr-resistances').innerHTML = (sr.resistances || []).map(r =>
+    `<div class="flex items-center justify-between bg-card2 rounded-lg p-2">
+       <div>
+         <span class="font-mono font-bold">Rs.${r.price.toLocaleString()}</span>
+         <span class="text-xs text-gray-500 ml-2">${r.distance_pct}% above</span>
+       </div>
+       <div class="flex items-center gap-2">
+         <span class="text-xs text-gray-500">${r.touches} touches</span>
+         <div class="w-16 score-bar"><div class="score-bar-fill bg-danger" style="width:${r.strength * 100}%"></div></div>
+       </div>
+     </div>`
+  ).join('') || '<div class="text-xs text-gray-500">No resistance levels detected</div>';
+
+  // Fair Value
+  renderFairValue(r.fair_value || {});
+
+  // Show Add Order button when report is loaded
+  const addOrderBtn = document.getElementById('btn-add-order');
+  if (addOrderBtn) addOrderBtn.classList.remove('hidden');
+
+  // ????????? PATTERN TABS ?????????
+  // Candlestick patterns
+  const cp = r.candlestick_patterns || [];
+  document.getElementById('candle-patterns').innerHTML = cp.length ?
+    cp.map(p => `<div class="flex items-start gap-3 bg-card2 rounded-lg p-3">
+      <span class="badge badge-${p.type} mt-0.5">${p.type}</span>
+      <div class="flex-1">
+        <div class="flex items-center gap-2">
+          <span class="font-bold text-sm">${p.name}</span>
+          <span class="text-xs text-gray-500">${p.date}</span>
+          <span class="text-xs font-mono text-gray-500">${p.confidence * 100}%</span>
+        </div>
+        <div class="text-xs text-gray-400 mt-1">${p.description}</div>
+      </div>
+    </div>`).join('') : '<div class="text-xs text-gray-500">No candlestick patterns detected in recent bars</div>';
+
+  // Chart patterns
+  const chp = r.chart_patterns || [];
+  document.getElementById('chart-patterns').innerHTML = chp.length ?
+    chp.map(p => `<div class="flex items-start gap-3 bg-card2 rounded-lg p-3">
+      <span class="badge badge-${p.type} mt-0.5">${p.type}</span>
+      <div class="flex-1">
+        <div class="flex items-center gap-2">
+          <span class="font-bold text-sm">${p.name}</span>
+          <span class="text-xs font-mono text-gray-500">${p.confidence * 100}%</span>
+        </div>
+        <div class="text-xs text-gray-400 mt-1">${p.description}</div>
+        ${p.details ? `<div class="text-xs text-gray-500 mt-1">${p.details}</div>` : ''}
+      </div>
+    </div>`).join('') : '<div class="text-xs text-gray-500">No chart patterns detected</div>';
+
+  // Pattern summary
+  const allPatterns = [...cp, ...chp];
+  document.getElementById('pat-bull-count').textContent = allPatterns.filter(p => p.type === 'bullish').length;
+  document.getElementById('pat-bear-count').textContent = allPatterns.filter(p => p.type === 'bearish').length;
+  document.getElementById('pat-neutral-count').textContent = allPatterns.filter(p => p.type === 'neutral').length;
+
+  // ????????? BEHAVIOR TAB ?????????
+  const bp = r.behavior_profile || {};
+  const vol = bp.volatility || {};
+
+  document.getElementById('bp-vol-regime').textContent = vol.regime || '--';
+  document.getElementById('bp-vol-regime').className = `text-3xl font-extrabold ${vol.color === 'green' ? 'text-bull' : vol.color === 'yellow' ? 'text-warn' : vol.color === 'orange' ? 'text-orange-400' : 'text-danger'}`;
+  document.getElementById('bp-vol-ann').textContent = `Annualized: ${vol.annualized || '--'}%`;
+  document.getElementById('bp-daily-std').textContent = (vol.daily_std || '--') + '%';
+  document.getElementById('bp-avg-daily').textContent = (bp.avg_daily_move_pct || '--') + '%';
+  document.getElementById('bp-avg-weekly').textContent = (bp.avg_weekly_move_pct || '--') + '%';
+
+  document.getElementById('bp-beh-type').textContent = bp.behavior_type || '--';
+  document.getElementById('bp-beh-desc').textContent = bp.behavior_description || '--';
+  document.getElementById('bp-autocorr').textContent = bp.autocorrelation || '--';
+
+  const tgt = bp.target_3pct || {};
+  document.getElementById('bp-hitrate').textContent = (tgt.hit_rate_pct || 0) + '%';
+  document.getElementById('bp-hitrate').className = `text-5xl font-extrabold font-mono ${tgt.hit_rate_pct >= 40 ? 'text-bull' : tgt.hit_rate_pct >= 25 ? 'text-warn' : 'text-danger'}`;
+  document.getElementById('bp-hitrate-detail').textContent = `${tgt.windows_analyzed || 0} windows analyzed`;
+  document.getElementById('bp-avg-days').innerHTML = tgt.avg_days_to_hit
+    ? `<span class="text-xs text-gray-500">Avg days to hit 3%: <span class="text-accent font-bold">${tgt.avg_days_to_hit} days</span></span>`
+    : '<span class="text-xs text-gray-500">Avg days to hit 3%: N/A</span>';
+
+  const gaps = bp.gaps || {};
+  document.getElementById('bp-gap-up').textContent = `${gaps.gap_up_count || 0} (${gaps.gap_up_pct || 0}%)`;
+  document.getElementById('bp-gap-down').textContent = `${gaps.gap_down_count || 0} (${gaps.gap_down_pct || 0}%)`;
+
+  const streaks = bp.streaks || {};
+  document.getElementById('bp-up-streak').textContent = streaks.max_up_streak || 0;
+  document.getElementById('bp-down-streak').textContent = streaks.max_down_streak || 0;
+  const csDir = streaks.current_streak_dir || 'neutral';
+  document.getElementById('bp-curr-streak').innerHTML = `${streaks.current_streak || 0} ${csDir.toUpperCase()}`;
+  document.getElementById('bp-curr-streak').className = `font-mono text-sm font-bold ${csDir === 'up' ? 'text-bull' : csDir === 'down' ? 'text-bear' : 'text-gray-400'}`;
+
+  const seas = bp.seasonality || {};
+  document.getElementById('bp-best-day').textContent = seas.best_day || '--';
+  document.getElementById('bp-best-day-avg').textContent = (seas.best_day_avg_return >= 0 ? '+' : '') + (seas.best_day_avg_return || 0) + '%';
+  document.getElementById('bp-worst-day').textContent = seas.worst_day || '--';
+  document.getElementById('bp-worst-day-avg').textContent = (seas.worst_day_avg_return >= 0 ? '+' : '') + (seas.worst_day_avg_return || 0) + '%';
+
+  // ????????? ML TAB ?????????
+  const ml = r.ml_prediction || {};
+  const sq = ml.signal_quality || 0;
+  document.getElementById('ml-sq').textContent = (sq * 100).toFixed(1) + '%';
+  document.getElementById('ml-sq-bar').style.width = (sq * 100) + '%';
+  document.getElementById('ml-sq').className = `text-2xl font-bold font-mono ${sq > 0.6 ? 'text-bull' : sq < 0.35 ? 'text-danger' : 'text-warn'}`;
+
+  const regime = ml.trend_regime || 'N/A';
+  document.getElementById('ml-regime').textContent = regime;
+  document.getElementById('ml-regime').className = `text-xl font-bold mt-1 ${regime === 'UPTREND' ? 'text-bull' : regime === 'DOWNTREND' ? 'text-danger' : 'text-warn'}`;
+  document.getElementById('ml-regime-conf').textContent = `Confidence: ${((ml.regime_confidence || 0) * 100).toFixed(0)}%`;
+
+  const eret = ml.expected_return || 0;
+  document.getElementById('ml-eret').textContent = (eret >= 0 ? '+' : '') + eret + '%';
+  document.getElementById('ml-eret').className = `text-2xl font-bold font-mono ${eret >= 0 ? 'text-bull' : 'text-danger'}`;
+
+  document.getElementById('ml-dd').textContent = (ml.max_drawdown || 0) + '%';
+  document.getElementById('ml-score').textContent = ml.ml_score || '--';
+  document.getElementById('ml-rr').textContent = (ml.risk_reward_ratio || 0) + 'x';
+
+  const act = ml.actionable || 'N/A';
+  document.getElementById('ml-action').textContent = act.replace('_', ' ');
+  document.getElementById('ml-action').className = `font-bold mt-1 badge badge-${(act || '').toLowerCase()}`;
+
+  // Regime probabilities
+  const rp = ml.regime_probabilities || {};
+  document.getElementById('ml-regime-probs').innerHTML = rp
+    ? Object.entries(rp).map(([k, v]) => `<div class="flex justify-between"><span class="text-gray-500">${k}</span><span>${(v * 100).toFixed(0)}%</span></div>`).join('')
+    : '--';
+}
+
+// ????????? SCAN ALL STOCKS ?????????
+async function scanAllStocks() {
+  document.getElementById('btn-scan').classList.add('hidden');
+  document.getElementById('btn-scan-loading').classList.remove('hidden');
+  switchTab('scanner');
+
+  try {
+    const data = await api('/api/stock-analysis/batch', { method: 'POST' });
+    scanResults = data.results || [];
+
+    document.getElementById('scan-sb').textContent = data.strong_buys;
+    document.getElementById('scan-buy').textContent = data.buys;
+    document.getElementById('scan-watch').textContent = data.watch;
+    document.getElementById('scan-wait').textContent = data.wait;
+    document.getElementById('scan-footer').textContent =
+      `Scanned ${data.total_scanned} tickers | Data available: ${data.data_available} | ${data.scan_time}`;
+
+    renderScanTable();
+  } catch (e) {
+    alert('Scan failed: ' + (e.message || 'Unknown error'));
+  } finally {
+    document.getElementById('btn-scan').classList.remove('hidden');
+    document.getElementById('btn-scan-loading').classList.add('hidden');
+  }
+}
+
+function renderScanTable() {
+  const filtered = scanFilter === 'ALL' ? scanResults : scanResults.filter(r => r.strategy_action === scanFilter);
+  const tbody = document.getElementById('scan-tbody');
+
+  if (!filtered.length) {
+    tbody.innerHTML = `<tr><td colspan="17" class="px-3 py-12 text-center text-gray-500">No stocks matching filter</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = filtered.map(r => {
+    // V2: Get top reason with proper color
+    let topReason = '--';
+    let reasonColor = 'text-gray-500';
+    if (r.reasons_tagged && r.reasons_tagged.length > 0) {
+      const pos = r.reasons_tagged.find(x => x.sentiment === 'positive');
+      if (pos) { topReason = pos.text; reasonColor = 'text-bull'; }
+      else {
+        const neu = r.reasons_tagged.find(x => x.sentiment === 'neutral');
+        topReason = (neu || r.reasons_tagged[0]).text;
+        reasonColor = 'text-gray-400';
+      }
+    } else if (r.reasons && r.reasons.length > 0) {
+      topReason = r.reasons[0];
+      reasonColor = topReason.includes('WARNING') ? 'text-danger' : 'text-bull';
+    }
+    const sigQ = (r.signal_quality || 0) * 100;
+    const rsiVal = r.rsi_value || 50;
+    const volR = r.volume_ratio || 1;
+    return `<tr class="border-b border-border/50 hover:bg-card2/50 transition cursor-pointer" onclick="analyzeFromScan('${r.ticker}')">
+      <td class="px-3 py-2"><span class="badge badge-${r.strategy_action.toLowerCase()}">${r.strategy_action.replace('_', ' ')}</span></td>
+      <td class="px-3 py-2 font-mono font-bold">${r.ticker}</td>
+      <td class="px-3 py-2 text-right font-mono">Rs.${r.current_price?.toLocaleString() || '--'}</td>
+      <td class="px-3 py-2 text-right font-mono ${r.confidence >= 65 ? 'text-bull' : r.confidence >= 45 ? 'text-warn' : 'text-gray-400'}">${r.confidence}%</td>
+      <td class="px-3 py-2 text-right font-mono ${sigQ >= 60 ? 'text-bull' : sigQ >= 40 ? 'text-warn' : 'text-danger'}">${sigQ.toFixed(0)}%</td>
+      <td class="px-3 py-2 text-right font-mono">${r.risk_reward}x</td>
+      <td class="px-3 py-2 text-right font-mono ${r.hit_rate_3pct >= 40 ? 'text-bull' : r.hit_rate_3pct >= 25 ? 'text-warn' : 'text-danger'}">${r.hit_rate_3pct}%</td>
+      <td class="px-3 py-2"><span class="${r.trend_regime === 'UPTREND' ? 'text-bull' : r.trend_regime === 'DOWNTREND' ? 'text-bear' : 'text-warn'}">${r.trend_regime}</span></td>
+      <td class="px-3 py-2 text-xs text-gray-400">${r.behavior_type || '--'}</td>
+      <td class="px-3 py-2 text-right font-mono ${r.expected_return >= 0 ? 'text-bull' : 'text-bear'}">${r.expected_return >= 0 ? '+' : ''}${r.expected_return}%</td>
+      <td class="px-3 py-2 text-right font-mono ${rsiVal >= 70 ? 'text-danger' : rsiVal <= 30 ? 'text-bull' : 'text-gray-400'}">${rsiVal.toFixed(0)}</td>
+      <td class="px-3 py-2 text-right font-mono ${volR >= 1.5 ? 'text-bull' : volR < 0.5 ? 'text-danger' : 'text-gray-400'}">${volR}x</td>
+      <td class="px-3 py-2 text-xs font-mono">Rs.${r.entry_price?.toLocaleString() || '--'}</td>
+      <td class="px-3 py-2 text-xs font-mono">Rs.${r.target_price?.toLocaleString() || '--'}</td>
+      <td class="px-3 py-2 text-xs font-mono">Rs.${r.stop_loss?.toLocaleString() || '--'}</td>
+      <td class="px-3 py-2 text-xs text-gray-400">${r.position_size || '--'}</td>
+      <td class="px-3 py-2 text-xs ${reasonColor} max-w-[180px] truncate" title="${(r.reasons || []).join('\n')}">${topReason}</td>
+    </tr>`;
+  }).join('');
+}
+
+function analyzeFromScan(ticker) {
+  document.getElementById('ticker-input').value = ticker;
+  analyzeStock();
+}
+
+function filterScan(action) {
+  scanFilter = action;
+  renderScanTable();
+}
+
+// ????????? TAB SWITCHING ?????????
+function switchTab(tab) {
+  ['strategy', 'patterns', 'behavior', 'ml', 'scanner', 'orders'].forEach(t => {
+    document.getElementById(`panel-${t}`).classList.toggle('hidden', t !== tab);
+    document.getElementById(`tab-${t}`).classList.toggle('tab-active', t === tab);
+    if (t !== tab) {
+      document.getElementById(`tab-${t}`).classList.add('text-gray-500');
+    } else {
+      document.getElementById(`tab-${t}`).classList.remove('text-gray-500');
+    }
+  });
+}
+
+
+// FAIR VALUE RENDERING
+function renderFairValue(fv) {
+  const el = document.getElementById('fair-value-info');
+  if (!fv || !fv.fair_value) {
+    el.innerHTML = '<div class="text-xs text-gray-500">Fair value not available (insufficient data)</div>';
+    return;
+  }
+  const gap = fv.gap_to_fair_pct;
+  const gapColor = gap < -2 ? 'text-bull' : gap > 2 ? 'text-danger' : 'text-warn';
+  const gapLabel = fv.is_undervalued ? 'UNDERVALUED' : fv.is_overvalued ? 'OVERVALUED' : 'NEAR FAIR VALUE';
+  const labelColor = fv.is_undervalued ? 'bg-bull/20 text-bull' : fv.is_overvalued ? 'bg-danger/20 text-danger' : 'bg-warn/20 text-warn';
+  const bd = fv.breakdown || {};
+
+  el.innerHTML = `
+    <div class="flex items-center justify-between mb-2">
+      <span class="text-gray-400 text-xs">Fair Value</span>
+      <span class="font-mono font-bold text-lg">Rs.${fv.fair_value.toLocaleString()}</span>
+    </div>
+    <div class="flex items-center justify-between mb-2">
+      <span class="text-gray-400 text-xs">Gap</span>
+      <span class="font-mono font-bold ${gapColor}">${gap >= 0 ? '+' : ''}${gap}%</span>
+    </div>
+    <div class="text-center mb-3">
+      <span class="text-xs px-2 py-0.5 rounded ${labelColor} font-bold">${gapLabel}</span>
+    </div>
+    <div class="space-y-1 text-xs border-t border-border pt-2">
+      <div class="flex justify-between"><span class="text-gray-500">SMA 200</span><span class="font-mono">Rs.${(bd.sma_200 || 0).toLocaleString()}</span></div>
+      <div class="flex justify-between"><span class="text-gray-500">EMA 50</span><span class="font-mono">Rs.${(bd.ema_50 || 0).toLocaleString()}</span></div>
+      <div class="flex justify-between"><span class="text-gray-500">SMA 20</span><span class="font-mono">Rs.${(bd.sma_20 || 0).toLocaleString()}</span></div>
+      <div class="flex justify-between"><span class="text-gray-500">Regression Trend</span><span class="font-mono">Rs.${(bd.regression_trend || 0).toLocaleString()}</span></div>
+    </div>
+  `;
+}
+
+// PAPER TRADING
+let allOrders = [];
+
+function openAddOrderModal() {
+  if (currentReport) {
+    document.getElementById('ord-ticker').value = currentReport.ticker || '';
+    document.getElementById('ord-price').value = currentReport.strategy?.entry?.price || '';
+    document.getElementById('ord-target').value = currentReport.strategy?.target?.price || '';
+    document.getElementById('ord-sl').value = currentReport.strategy?.stop_loss?.price || '';
+    document.getElementById('ord-notes').value = (currentReport.strategy?.strategy_action || '') + ' | Conf: ' + (currentReport.strategy?.confidence || '') + '%';
+  }
+  document.getElementById('order-modal').classList.remove('hidden');
+}
+
+function closeOrderModal() {
+  document.getElementById('order-modal').classList.add('hidden');
+}
+
+async function submitOrder() {
+  const ticker = document.getElementById('ord-ticker').value.trim().toUpperCase();
+  const action = document.getElementById('ord-action').value;
+  const qty = parseInt(document.getElementById('ord-qty').value) || 1;
+  const price = parseFloat(document.getElementById('ord-price').value);
+  const target = parseFloat(document.getElementById('ord-target').value) || null;
+  const sl = parseFloat(document.getElementById('ord-sl').value) || null;
+  const notes = document.getElementById('ord-notes').value;
+
+  if (!ticker) return alert('Enter a ticker');
+  if (!price || price <= 0) return alert('Enter a valid entry price');
+
+  try {
+    await api('/api/orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticker, action, quantity: qty, price, target_price: target, stop_loss: sl, notes })
+    });
+    closeOrderModal();
+    loadOrders();
+  } catch (e) {
+    alert('Failed to add order: ' + e.message);
+  }
+}
+
+function openCloseModal(orderId, currentPrice) {
+  document.getElementById('close-ord-id').value = orderId;
+  document.getElementById('close-ord-price').value = currentPrice || '';
+  document.getElementById('close-ord-status').value = 'CLOSED';
+  document.getElementById('close-order-modal').classList.remove('hidden');
+}
+
+function closeCloseModal() {
+  document.getElementById('close-order-modal').classList.add('hidden');
+}
+
+async function submitCloseOrder() {
+  const orderId = document.getElementById('close-ord-id').value;
+  const exitPrice = parseFloat(document.getElementById('close-ord-price').value) || null;
+  const status = document.getElementById('close-ord-status').value;
+
+  try {
+    await api(`/api/orders/${orderId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status, exit_price: exitPrice })
+    });
+    closeCloseModal();
+    loadOrders();
+  } catch (e) {
+    alert('Failed to update order: ' + e.message);
+  }
+}
+
+async function deleteOrder(orderId) {
+  if (!confirm('Delete this order?')) return;
+  try {
+    await api(`/api/orders/${orderId}`, { method: 'DELETE' });
+    loadOrders();
+  } catch (e) {
+    alert('Failed to delete: ' + e.message);
+  }
+}
+
+async function loadOrders() {
+  const tickerFilter = document.getElementById('ord-filter-ticker').value.trim().toUpperCase();
+  const statusFilter = document.getElementById('ord-filter-status').value;
+  const params = new URLSearchParams();
+  if (tickerFilter) params.set('ticker', tickerFilter);
+  if (statusFilter) params.set('status', statusFilter);
+
+  try {
+    const qs = params.toString() ? '?' + params.toString() : '';
+    const data = await api('/api/orders' + qs);
+    allOrders = data.orders || [];
+
+    // Summary
+    const pnl = data.total_pnl || 0;
+    document.getElementById('ord-total-pnl').textContent = 'Rs.' + pnl.toLocaleString();
+    document.getElementById('ord-total-pnl').className = `text-xl font-bold font-mono ${pnl >= 0 ? 'text-bull' : 'text-danger'}`;
+    document.getElementById('ord-win-rate').textContent = (data.win_rate || 0) + '%';
+    document.getElementById('ord-open').textContent = data.open_count || 0;
+    document.getElementById('ord-closed').textContent = data.closed_count || 0;
+    document.getElementById('ord-stocks').textContent = Object.keys(data.ticker_summary || {}).length;
+
+    // Ticker cards
+    const summary = data.ticker_summary || {};
+    const cardsEl = document.getElementById('ord-ticker-cards');
+    if (Object.keys(summary).length > 0 && !tickerFilter) {
+      cardsEl.innerHTML = Object.entries(summary).sort((a, b) => (b[1].total_orders) - (a[1].total_orders)).map(([t, s]) => `
+        <div class="bg-card rounded-lg border border-border p-3 cursor-pointer hover:border-accent/50 transition" onclick="document.getElementById('ord-filter-ticker').value='${t}';loadOrders()">
+          <div class="font-mono font-bold text-sm">${t}</div>
+          <div class="text-xs text-gray-500 mt-1">${s.total_orders} orders | ${s.open} open</div>
+          <div class="text-xs font-mono mt-1 ${s.closed_pnl >= 0 ? 'text-bull' : 'text-danger'}">P&L: Rs.${s.closed_pnl.toLocaleString()}</div>
+        </div>
+      `).join('');
+      cardsEl.classList.remove('hidden');
+    } else {
+      cardsEl.innerHTML = '';
+      cardsEl.classList.add('hidden');
+    }
+
+    // Table
+    const tbody = document.getElementById('ord-tbody');
+    if (!allOrders.length) {
+      tbody.innerHTML = '<tr><td colspan="12" class="px-3 py-12 text-center text-gray-500">No orders found</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = allOrders.map(o => {
+      const pnlCls = (o.pnl || 0) >= 0 ? 'text-bull' : 'text-danger';
+      const actionCls = o.action === 'BUY' ? 'text-bull' : 'text-bear';
+      const statusCls = o.status === 'OPEN' ? 'bg-warn/20 text-warn' : o.status === 'CLOSED' ? 'bg-accent2/20 text-accent2' : 'bg-gray-500/20 text-gray-500';
+      const closeBtn = o.status === 'OPEN' 
+        ? `<button onclick="openCloseModal('${o.id}', ${o.entry_price})" class="text-xs px-2 py-0.5 rounded bg-accent/20 text-accent hover:bg-accent/30">Close</button>` 
+        : '';
+      return `<tr class="border-b border-border/50 hover:bg-card2/50">
+        <td class="px-3 py-2 text-xs text-gray-400">${o.entry_date || '--'}</td>
+        <td class="px-3 py-2 font-mono font-bold">${o.ticker}</td>
+        <td class="px-3 py-2 font-bold ${actionCls}">${o.action}</td>
+        <td class="px-3 py-2 text-right font-mono">${o.quantity}</td>
+        <td class="px-3 py-2 text-right font-mono">Rs.${o.entry_price?.toLocaleString() || '--'}</td>
+        <td class="px-3 py-2 text-right font-mono text-bull">${o.target_price ? 'Rs.' + o.target_price.toLocaleString() : '--'}</td>
+        <td class="px-3 py-2 text-right font-mono text-danger">${o.stop_loss ? 'Rs.' + o.stop_loss.toLocaleString() : '--'}</td>
+        <td class="px-3 py-2 text-right font-mono">${o.exit_price ? 'Rs.' + o.exit_price.toLocaleString() : '--'}</td>
+        <td class="px-3 py-2 text-right font-mono font-bold ${pnlCls}">${o.pnl != null ? 'Rs.' + o.pnl.toLocaleString() + ' (' + o.pnl_pct + '%)' : '--'}</td>
+        <td class="px-3 py-2"><span class="text-xs px-2 py-0.5 rounded ${statusCls}">${o.status}</span></td>
+        <td class="px-3 py-2 text-xs text-gray-500 max-w-[120px] truncate" title="${o.notes || ''}">${o.notes || '--'}</td>
+        <td class="px-3 py-2 text-center whitespace-nowrap">
+          ${closeBtn}
+          <button onclick="deleteOrder('${o.id}')" class="text-xs px-2 py-0.5 rounded bg-danger/20 text-danger hover:bg-danger/30 ml-1">Del</button>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    console.error('Orders load error:', e);
+  }
+}
+
+// ????????? INIT ?????????
+checkHealth();
+loadTickers();
+setInterval(checkHealth, 30000);
+const _origSwitch = switchTab;
+switchTab = function(tab) {
+  _origSwitch(tab);
+  if (tab === 'orders') loadOrders();
+};
+</script>
+</body>
+</html>
