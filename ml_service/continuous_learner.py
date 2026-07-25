@@ -441,13 +441,56 @@ class ContinuousLearner:
                 self.mm._build_missing_models()
                 prod_model = self.mm.models.get(model_type)
 
-        # Lower learning rate for fine-tuning
+        # ── FIX: Recompile model with fresh loss objects (Keras 3 compatibility) ──
+        # When models are saved/loaded, losses become strings internally.
+        # Keras 3 then crashes with "'str' object has no attribute 'name'".
+        # Recompiling with fresh loss objects fixes this.
         import tensorflow as tf
-        keras_backend = tf.keras.backend
-        keras_backend.set_value(prod_model.optimizer.learning_rate, FINE_TUNE_LEARNING_RATE)
+        from tensorflow import keras
+
+        try:
+            if model_type == "signal_quality":
+                prod_model.compile(
+                    optimizer=keras.optimizers.Adam(learning_rate=FINE_TUNE_LEARNING_RATE),
+                    loss=keras.losses.BinaryCrossentropy(),
+                    metrics=["accuracy"],
+                )
+            elif model_type == "trend_regime":
+                prod_model.compile(
+                    optimizer=keras.optimizers.Adam(learning_rate=FINE_TUNE_LEARNING_RATE),
+                    loss=keras.losses.SparseCategoricalCrossentropy(),
+                    metrics=["accuracy"],
+                )
+            elif model_type == "return_forecaster":
+                prod_model.compile(
+                    optimizer=keras.optimizers.Adam(learning_rate=FINE_TUNE_LEARNING_RATE),
+                    loss={
+                        "return_pct": keras.losses.MeanSquaredError(),
+                        "max_gain_pct": keras.losses.MeanSquaredError(),
+                        "max_loss_pct": keras.losses.MeanSquaredError(),
+                    },
+                    loss_weights={
+                        "return_pct": 1.0,
+                        "max_gain_pct": 0.5,
+                        "max_loss_pct": 0.5,
+                    },
+                )
+            elif model_type == "risk_estimator":
+                prod_model.compile(
+                    optimizer=keras.optimizers.Adam(learning_rate=FINE_TUNE_LEARNING_RATE),
+                    loss=keras.losses.MeanSquaredError(),
+                )
+            logger.info(f"[ContinuousLearner] {model_type}: recompiled with fresh loss objects")
+        except Exception as e:
+            logger.warning(f"[ContinuousLearner] {model_type}: recompile failed ({e}), trying legacy LR set")
+            # Fallback: try the old way
+            try:
+                keras_backend = tf.keras.backend
+                keras_backend.set_value(prod_model.optimizer.learning_rate, FINE_TUNE_LEARNING_RATE)
+            except Exception:
+                pass
 
         # Train
-        from tensorflow import keras
         callbacks_list = [
             keras.callbacks.EarlyStopping(
                 monitor="val_loss", patience=3,
@@ -544,12 +587,46 @@ class ContinuousLearner:
             self.mm._build_missing_models()
             model = self.mm.models.get(model_type)
 
-        # Reset learning rate
+        # ── FIX: Recompile with fresh loss objects (Keras 3 compatibility) ──
         import tensorflow as tf
-        keras_backend = tf.keras.backend
-        keras_backend.set_value(model.optimizer.learning_rate, FULL_RETRAIN_LEARNING_RATE)
-
         from tensorflow import keras
+
+        try:
+            if model_type == "signal_quality":
+                model.compile(
+                    optimizer=keras.optimizers.Adam(learning_rate=FULL_RETRAIN_LEARNING_RATE),
+                    loss=keras.losses.BinaryCrossentropy(),
+                    metrics=["accuracy"],
+                )
+            elif model_type == "trend_regime":
+                model.compile(
+                    optimizer=keras.optimizers.Adam(learning_rate=FULL_RETRAIN_LEARNING_RATE),
+                    loss=keras.losses.SparseCategoricalCrossentropy(),
+                    metrics=["accuracy"],
+                )
+            elif model_type == "return_forecaster":
+                model.compile(
+                    optimizer=keras.optimizers.Adam(learning_rate=FULL_RETRAIN_LEARNING_RATE),
+                    loss={
+                        "return_pct": keras.losses.MeanSquaredError(),
+                        "max_gain_pct": keras.losses.MeanSquaredError(),
+                        "max_loss_pct": keras.losses.MeanSquaredError(),
+                    },
+                    loss_weights={
+                        "return_pct": 1.0,
+                        "max_gain_pct": 0.5,
+                        "max_loss_pct": 0.5,
+                    },
+                )
+            elif model_type == "risk_estimator":
+                model.compile(
+                    optimizer=keras.optimizers.Adam(learning_rate=FULL_RETRAIN_LEARNING_RATE),
+                    loss=keras.losses.MeanSquaredError(),
+                )
+            logger.info(f"[ContinuousLearner] {model_type}: recompiled for full retrain")
+        except Exception as e:
+            logger.warning(f"[ContinuousLearner] {model_type}: recompile failed ({e})")
+
         callbacks_list = [
             keras.callbacks.EarlyStopping(
                 monitor="val_loss", patience=5,
@@ -767,3 +844,44 @@ class ContinuousLearner:
             return X_norm
         except ImportError:
             return X
+
+
+# ── Singleton accessor ────────────────────────────────────────────────────────
+_learner: Optional[ContinuousLearner] = None
+_learner_lock = threading.Lock()
+
+
+def get_learner() -> ContinuousLearner:
+    """Get the singleton ContinuousLearner instance.
+
+    Raises ValueError if not yet initialized — call setup_learner() first
+    (typically from ml_service.py startup_event).
+    """
+    global _learner
+    if _learner is None:
+        raise ValueError(
+            "ContinuousLearner not initialized. Call setup_learner() first "
+            "(typically done in ml_service.py startup_event)."
+        )
+    return _learner
+
+
+def setup_learner(model_manager,
+                  feature_extractor: Callable,
+                  target_pct: float = 3.0,
+                  lookahead_days: int = 5) -> ContinuousLearner:
+    """Initialize the singleton ContinuousLearner instance.
+
+    Call this from ml_service.py startup_event() after model_manager is ready.
+    """
+    global _learner
+    with _learner_lock:
+        if _learner is None:
+            _learner = ContinuousLearner(
+                model_manager=model_manager,
+                feature_extractor=feature_extractor,
+                target_pct=target_pct,
+                lookahead_days=lookahead_days,
+            )
+            logger.info("[ContinuousLearner] Singleton initialized via setup_learner()")
+        return _learner

@@ -1,0 +1,1186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Historical Performance — ML Stock Intelligence</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      fontFamily: { ui: ['"Exo 2"', 'sans-serif'], mono: ['"JetBrains Mono"', 'monospace'] },
+      colors: {
+        base: '#030912', card: '#0a1628', card2: '#0f1d32', card3: '#131f38',
+        border: '#1a2d4a', border2: '#243a5c',
+        accent: '#00e5a0', accent2: '#00b8d4', warn: '#f59e0b', danger: '#ef4444',
+        ml: '#a78bfa', ml2: '#c084fc', bull: '#22c55e', bear: '#ef4444',
+      }
+    }
+  }
+}
+</script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Exo 2', sans-serif; background: #030912; color: #e2e8f0; min-height: 100vh; }
+.font-mono { font-family: 'JetBrains Mono', monospace; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #0a1628; }
+::-webkit-scrollbar-thumb { background: #1a2d4a; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #243a5c; }
+.glow { box-shadow: 0 0 20px rgba(0, 229, 160, 0.12); }
+.glow-purple { box-shadow: 0 0 20px rgba(167, 139, 250, 0.12); }
+.pulse-dot { animation: pulse 2s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner { animation: spin 1s linear infinite; border: 3px solid #1a2d4a; border-top-color: #a78bfa; border-radius: 50%; width: 20px; height: 20px; display: inline-block; vertical-align: middle; }
+.tab-active { border-bottom: 2px solid #a78bfa; color: #a78bfa; background: rgba(167, 139, 250, 0.05); }
+.fade-in { animation: fadeIn 0.3s ease-in; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.badge { padding: 2px 8px; border-radius: 4px; font-size: 0.65rem; font-weight: 700; letter-spacing: 0.5px; display: inline-block; }
+.badge-hit { background: rgba(34,197,94,0.2); color: #22c55e; border: 1px solid rgba(34,197,94,0.3); }
+.badge-missed { background: rgba(239,68,68,0.2); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
+.badge-running { background: rgba(245,158,11,0.2); color: #f59e0b; border: 1px solid rgba(245,158,11,0.3); }
+.badge-prod { background: rgba(0,229,160,0.2); color: #00e5a0; border: 1px solid rgba(0,229,160,0.3); }
+select { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%2394a3b8' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; appearance: none; }
+.sortable th { cursor: pointer; user-select: none; }
+.sortable th:hover { color: #a78bfa; }
+.sort-asc::after { content: ' ↑'; color: #a78bfa; }
+.sort-desc::after { content: ' ↓'; color: #a78bfa; }
+.stat-card { transition: transform 0.2s, box-shadow 0.2s; }
+.stat-card:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,229,160,0.15); }
+
+/* CHART FIX: explicit container heights so Chart.js can calculate width */
+.chart-container { position: relative; height: 220px; width: 100%; }
+.chart-container canvas { max-width: 100%; }
+.chart-container-tall { position: relative; height: 280px; width: 100%; }
+.chart-container-tall canvas { max-width: 100%; }
+
+/* Hide tab panels properly */
+.tab-panel { display: block; }
+.tab-panel.hidden { display: none !important; }
+</style>
+</head>
+<body class="p-3 md:p-5">
+
+<!-- TOP BAR -->
+<div class="flex items-center justify-between mb-5">
+  <div class="flex items-center gap-3">
+    <a href="/" class="text-xs text-gray-500 hover:text-gray-300 transition">← ML Dashboard</a>
+    <div class="w-px h-5 bg-border"></div>
+    <div>
+      <h1 class="text-xl md:text-2xl font-bold">
+        <span class="text-ml">📊 Historical Performance</span>
+      </h1>
+      <p class="text-xs text-gray-500 mt-0.5">10-year backtest • Per-stock accuracy • Model comparison • Trade log</p>
+    </div>
+  </div>
+  <div class="flex items-center gap-3">
+    <select id="period-select" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200 pr-8 focus:outline-none focus:border-ml/50">
+      <option value="7d">Last 7 days</option>
+      <option value="30d">Last 30 days</option>
+      <option value="90d" selected>Last 90 days</option>
+      <option value="1y">Last 1 year</option>
+      <option value="5y">Last 5 years</option>
+      <option value="10y">Last 10 years</option>
+      <option value="all">All time</option>
+    </select>
+    <button id="refresh-btn" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-300 hover:bg-card3 transition">⟳ Refresh</button>
+    <button id="clear-data-btn" class="bg-danger/20 border border-danger/40 text-danger rounded-lg px-3 py-1.5 text-sm font-medium hover:bg-danger/30 transition">🗑 Clear Data</button>
+    <span id="status-dot" class="w-2.5 h-2.5 rounded-full bg-gray-500 pulse-dot"></span>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<!--  CLEAR DATA MODAL                                                         -->
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<div id="clear-modal" class="hidden fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4" style="display:none">
+  <div class="bg-card border border-danger/40 rounded-xl p-6 max-w-lg w-full shadow-2xl">
+    <div class="flex items-start gap-3 mb-4">
+      <div class="text-2xl">🗑</div>
+      <div class="flex-1">
+        <h3 class="text-lg font-bold text-danger">Clear Backtest Data</h3>
+        <p class="text-xs text-gray-500 mt-1">This action <strong>cannot be undone</strong>. All historical predictions, accuracy stats, and backtest runs will be permanently deleted.</p>
+      </div>
+      <button onclick="closeClearModal()" class="text-gray-500 hover:text-gray-300 text-xl leading-none">×</button>
+    </div>
+
+    <!-- Preview content -->
+    <div id="clear-preview" class="bg-card2 rounded-lg p-4 mb-4 text-sm">
+      <div class="text-gray-400 mb-2">Data that will be deleted:</div>
+      <div id="clear-preview-content" class="space-y-1 font-mono text-xs">
+        <div class="text-gray-500">Loading preview...</div>
+      </div>
+    </div>
+
+    <!-- Scope selector -->
+    <div class="mb-4">
+      <label class="text-xs text-gray-500 block mb-2">What to clear:</label>
+      <select id="clear-scope" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm text-gray-200 pr-8">
+        <option value="all">Everything (predictions + accuracy + runs)</option>
+        <option value="predictions">Only predictions</option>
+        <option value="accuracy">Only accuracy stats</option>
+        <option value="runs">Only backtest runs</option>
+      </select>
+    </div>
+
+    <!-- Confirmation checkbox -->
+    <label class="flex items-center gap-2 mb-4 text-sm text-gray-300 cursor-pointer">
+      <input type="checkbox" id="clear-confirm-check" class="rounded bg-card2 border-border">
+      I understand this action is permanent and cannot be undone
+    </label>
+
+    <!-- Action buttons -->
+    <div class="flex gap-3 justify-end">
+      <button onclick="closeClearModal()" class="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 border border-border rounded-lg hover:bg-card2 transition">Cancel</button>
+      <button id="clear-execute-btn" disabled class="px-4 py-2 text-sm bg-danger/20 border border-danger/40 text-danger rounded-lg hover:bg-danger/30 transition disabled:opacity-30 disabled:cursor-not-allowed">🗑 Delete Permanently</button>
+    </div>
+
+    <!-- Result message -->
+    <div id="clear-result" class="hidden mt-4 p-3 rounded-lg text-sm"></div>
+  </div>
+</div>
+
+<!-- TABS -->
+<div class="flex border-b border-border mb-5 overflow-x-auto">
+  <button class="tab-btn px-4 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 transition tab-active" data-tab="overview">Overview</button>
+  <button class="tab-btn px-4 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 transition" data-tab="stocks">Stocks</button>
+  <button class="tab-btn px-4 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 transition" data-tab="trades">Trade Log</button>
+  <button class="tab-btn px-4 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 transition" data-tab="models">Model Comparison</button>
+  <button class="tab-btn px-4 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 transition" data-tab="trends">Trends</button>
+  <button class="tab-btn px-4 py-2 text-sm font-medium text-gray-400 hover:text-gray-200 transition" data-tab="backtest">Run Backtest</button>
+</div>
+
+<!-- TAB CONTENT -->
+<div id="tab-content">
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<!--  TAB: OVERVIEW                                                            -->
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<div id="tab-overview" class="tab-panel">
+  <div id="overview-loading" class="text-center py-12 text-gray-500"><span class="spinner"></span> Loading...</div>
+  <div id="overview-content" class="hidden">
+
+  <!-- Stats grid -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
+    <div class="stat-card bg-card rounded-xl p-4 border border-border">
+      <div class="text-xs text-gray-500 mb-1">Hit Rate</div>
+      <div class="text-2xl font-bold font-mono text-bull" id="stat-hit-rate">--</div>
+      <div class="text-xs text-gray-600 mt-1" id="stat-hit-detail">-- hits / -- misses</div>
+    </div>
+    <div class="stat-card bg-card rounded-xl p-4 border border-border">
+      <div class="text-xs text-gray-500 mb-1">Direction Accuracy</div>
+      <div class="text-2xl font-bold font-mono text-accent2" id="stat-dir-acc">--</div>
+      <div class="text-xs text-gray-600 mt-1">predicted vs actual</div>
+    </div>
+    <div class="stat-card bg-card rounded-xl p-4 border border-border">
+      <div class="text-xs text-gray-500 mb-1">Avg Return</div>
+      <div class="text-2xl font-bold font-mono text-accent" id="stat-avg-return">--</div>
+      <div class="text-xs text-gray-600 mt-1">per trade</div>
+    </div>
+    <div class="stat-card bg-card rounded-xl p-4 border border-border">
+      <div class="text-xs text-gray-500 mb-1">Sharpe Ratio</div>
+      <div class="text-2xl font-bold font-mono text-ml" id="stat-sharpe">--</div>
+      <div class="text-xs text-gray-600 mt-1">risk-adjusted</div>
+    </div>
+  </div>
+
+  <!-- Status counts -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-5">
+    <div class="bg-card rounded-xl p-3 border border-border">
+      <div class="text-xs text-gray-500 mb-1">Total Predictions</div>
+      <div class="text-xl font-bold font-mono text-gray-200" id="stat-total">--</div>
+    </div>
+    <div class="bg-card rounded-xl p-3 border border-bull/30">
+      <div class="text-xs text-gray-500 mb-1">Hits <span class="badge badge-hit ml-1">HIT</span></div>
+      <div class="text-xl font-bold font-mono text-bull" id="stat-hits">--</div>
+    </div>
+    <div class="bg-card rounded-xl p-3 border border-bear/30">
+      <div class="text-xs text-gray-500 mb-1">Misses <span class="badge badge-missed ml-1">MISS</span></div>
+      <div class="text-xl font-bold font-mono text-bear" id="stat-misses">--</div>
+    </div>
+    <div class="bg-card rounded-xl p-3 border border-warn/30">
+      <div class="text-xs text-gray-500 mb-1">Running <span class="badge badge-running ml-1">LIVE</span></div>
+      <div class="text-xl font-bold font-mono text-warn" id="stat-running">--</div>
+    </div>
+  </div>
+
+  <!-- Charts -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-5">
+    <div class="bg-card rounded-xl p-4 border border-border">
+      <div class="text-sm font-semibold mb-3 text-gray-300">Hit Rate Trend (rolling)</div>
+      <div class="chart-container"><canvas id="chart-hit-rate"></canvas></div>
+    </div>
+    <div class="bg-card rounded-xl p-4 border border-border">
+      <div class="text-sm font-semibold mb-3 text-gray-300">Predicted vs Actual Return</div>
+      <div class="chart-container"><canvas id="chart-pred-vs-actual"></canvas></div>
+    </div>
+  </div>
+
+  <!-- Top / Bottom stocks -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div class="bg-card rounded-xl p-4 border border-border">
+      <div class="text-sm font-semibold mb-3 text-bull">⬆ Top 5 Stocks (by hit rate)</div>
+      <div id="top-stocks" class="space-y-2"></div>
+    </div>
+    <div class="bg-card rounded-xl p-4 border border-border">
+      <div class="text-sm font-semibold mb-3 text-bear">⬇ Bottom 5 Stocks</div>
+      <div id="bottom-stocks" class="space-y-2"></div>
+    </div>
+  </div>
+
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<!--  TAB: STOCKS                                                              -->
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<div id="tab-stocks" class="tab-panel hidden">
+  <div class="bg-card rounded-xl border border-border p-4 mb-4">
+    <div class="flex flex-wrap gap-3 items-center">
+      <input id="stock-search" type="text" placeholder="Search ticker..." class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-ml/50 w-40">
+      <select id="stock-sort" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200 pr-8">
+        <option value="hit_rate">Sort: Hit Rate</option>
+        <option value="total_predictions">Sort: Total Predictions</option>
+        <option value="avg_return">Sort: Avg Return</option>
+        <option value="direction_accuracy">Sort: Direction Accuracy</option>
+        <option value="profit_factor">Sort: Profit Factor</option>
+        <option value="sharpe_ratio">Sort: Sharpe Ratio</option>
+        <option value="ticker">Sort: Ticker (A-Z)</option>
+      </select>
+      <select id="stock-min-pred" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200 pr-8">
+        <option value="0">Min predictions: 0</option>
+        <option value="10" selected>Min: 10</option>
+        <option value="50">Min: 50</option>
+        <option value="100">Min: 100</option>
+      </select>
+      <span class="text-xs text-gray-500 ml-auto" id="stock-count">Loading...</span>
+    </div>
+  </div>
+
+  <div class="bg-card rounded-xl border border-border overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm sortable">
+        <thead class="bg-card2 border-b border-border">
+          <tr class="text-left text-xs text-gray-500 uppercase">
+            <th class="p-3" data-sort="ticker">Ticker</th>
+            <th class="p-3 text-right" data-sort="total_predictions">Total</th>
+            <th class="p-3 text-right" data-sort="hits">Hits</th>
+            <th class="p-3 text-right" data-sort="misses">Misses</th>
+            <th class="p-3 text-right" data-sort="hit_rate">Hit Rate</th>
+            <th class="p-3 text-right" data-sort="avg_return">Avg Return</th>
+            <th class="p-3 text-right" data-sort="direction_accuracy">Dir Acc</th>
+            <th class="p-3 text-right" data-sort="profit_factor">Profit Factor</th>
+            <th class="p-3 text-right" data-sort="sharpe_ratio">Sharpe</th>
+            <th class="p-3 text-right">Best</th>
+            <th class="p-3 text-right">Worst</th>
+          </tr>
+        </thead>
+        <tbody id="stocks-tbody">
+          <tr><td colspan="11" class="p-8 text-center text-gray-500">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="p-3 border-t border-border flex items-center justify-between text-xs text-gray-500">
+      <span id="stocks-pagination-info">--</span>
+      <div class="flex gap-2">
+        <button id="stocks-prev" class="px-3 py-1 bg-card2 border border-border rounded hover:bg-card3 disabled:opacity-30" disabled>← Prev</button>
+        <button id="stocks-next" class="px-3 py-1 bg-card2 border border-border rounded hover:bg-card3 disabled:opacity-30" disabled>Next →</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<!--  TAB: TRADE LOG                                                           -->
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<div id="tab-trades" class="tab-panel hidden">
+  <div class="bg-card rounded-xl border border-border p-4 mb-4">
+    <div class="flex flex-wrap gap-3 items-center">
+      <input id="trade-ticker" type="text" placeholder="Ticker filter" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200 w-32">
+      <select id="trade-status" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200 pr-8">
+        <option value="">All statuses</option>
+        <option value="HIT">HIT</option>
+        <option value="MISSED">MISSED</option>
+        <option value="RUNNING">RUNNING</option>
+      </select>
+      <input id="trade-start" type="date" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200">
+      <input id="trade-end" type="date" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200">
+      <button id="trade-apply" class="bg-ml/20 border border-ml/30 text-ml rounded-lg px-3 py-1.5 text-sm hover:bg-ml/30">Apply</button>
+      <span class="text-xs text-gray-500 ml-auto" id="trade-count">Loading...</span>
+    </div>
+  </div>
+
+  <div class="bg-card rounded-xl border border-border overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="bg-card2 border-b border-border">
+          <tr class="text-left text-xs text-gray-500 uppercase">
+            <th class="p-3">Ticker</th>
+            <th class="p-3">Date</th>
+            <th class="p-3">Model</th>
+            <th class="p-3 text-right">Predicted</th>
+            <th class="p-3 text-right">Actual</th>
+            <th class="p-3 text-right">Max Gain</th>
+            <th class="p-3 text-right">Max Loss</th>
+            <th class="p-3 text-center">Status</th>
+            <th class="p-3 text-right">Days to Hit</th>
+            <th class="p-3 text-right">P&L %</th>
+          </tr>
+        </thead>
+        <tbody id="trades-tbody">
+          <tr><td colspan="10" class="p-8 text-center text-gray-500">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="p-3 border-t border-border flex items-center justify-between text-xs text-gray-500">
+      <span id="trades-pagination-info">--</span>
+      <div class="flex gap-2">
+        <button id="trades-prev" class="px-3 py-1 bg-card2 border border-border rounded hover:bg-card3 disabled:opacity-30" disabled>← Prev</button>
+        <button id="trades-next" class="px-3 py-1 bg-card2 border border-border rounded hover:bg-card3 disabled:opacity-30" disabled>Next →</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<!--  TAB: MODEL COMPARISON                                                    -->
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<div id="tab-models" class="tab-panel hidden">
+  <div id="models-loading" class="text-center py-12 text-gray-500"><span class="spinner"></span> Loading...</div>
+  <div id="models-content" class="hidden">
+    <div class="bg-card rounded-xl border border-border p-4 mb-4">
+      <div class="text-sm text-gray-400">
+        Each model version is evaluated on the same historical data. Higher = better.
+        <span class="badge badge-prod ml-2">PROD</span> = current production model.
+      </div>
+    </div>
+    <div class="bg-card rounded-xl border border-border overflow-hidden">
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="bg-card2 border-b border-border">
+            <tr class="text-left text-xs text-gray-500 uppercase">
+              <th class="p-3">Model Version</th>
+              <th class="p-3 text-center">Status</th>
+              <th class="p-3 text-right">Predictions</th>
+              <th class="p-3 text-right">Hit Rate</th>
+              <th class="p-3 text-right">Dir Acc</th>
+              <th class="p-3 text-right">Return MAE</th>
+              <th class="p-3 text-right">Profit Factor</th>
+              <th class="p-3 text-right">Sharpe</th>
+              <th class="p-3 text-right">Best</th>
+              <th class="p-3 text-right">Worst</th>
+            </tr>
+          </thead>
+          <tbody id="models-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="mt-4 bg-card rounded-xl border border-border p-4">
+      <div class="text-sm font-semibold mb-3 text-gray-300">Model Comparison Chart</div>
+      <div class="chart-container-tall"><canvas id="chart-models"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<!--  TAB: TRENDS                                                              -->
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<div id="tab-trends" class="tab-panel hidden">
+  <div class="bg-card rounded-xl border border-border p-4 mb-4">
+    <div class="flex flex-wrap gap-3 items-center">
+      <select id="trend-bucket" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200 pr-8">
+        <option value="weekly" selected>Weekly</option>
+        <option value="monthly">Monthly</option>
+      </select>
+      <select id="trend-days" class="bg-card2 border border-border rounded-lg px-3 py-1.5 text-sm text-gray-200 pr-8">
+        <option value="90">Last 90 days</option>
+        <option value="180" selected>Last 180 days</option>
+        <option value="365">Last 1 year</option>
+        <option value="730">Last 2 years</option>
+        <option value="1825">Last 5 years</option>
+      </select>
+    </div>
+  </div>
+  <div id="trends-loading" class="text-center py-12 text-gray-500"><span class="spinner"></span> Loading...</div>
+  <div id="trends-content" class="hidden space-y-4">
+    <div class="bg-card rounded-xl border border-border p-4">
+      <div class="text-sm font-semibold mb-3 text-gray-300">Hit Rate Over Time</div>
+      <div class="chart-container"><canvas id="chart-trend-hit"></canvas></div>
+    </div>
+    <div class="bg-card rounded-xl border border-border p-4">
+      <div class="text-sm font-semibold mb-3 text-gray-300">Predicted vs Actual Return Over Time</div>
+      <div class="chart-container"><canvas id="chart-trend-returns"></canvas></div>
+    </div>
+    <div class="bg-card rounded-xl border border-border p-4">
+      <div class="text-sm font-semibold mb-3 text-gray-300">Direction Accuracy & Return MAE</div>
+      <div class="chart-container"><canvas id="chart-trend-acc"></canvas></div>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<!--  TAB: RUN BACKTEST                                                        -->
+<!-- ════════════════════════════════════════════════════════════════════════ -->
+<div id="tab-backtest" class="tab-panel hidden">
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div class="bg-card rounded-xl border border-border p-5">
+      <div class="text-base font-semibold mb-4 text-ml">🚀 Start New Backtest</div>
+      <div class="space-y-3">
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Tickers (comma-separated, empty = all)</label>
+          <input id="bt-tickers" type="text" placeholder="RELIANCE,INFY,TCS" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm text-gray-200">
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Start Date</label>
+            <input id="bt-start" type="date" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm text-gray-200">
+          </div>
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">End Date</label>
+            <input id="bt-end" type="date" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm text-gray-200">
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Model Version</label>
+            <input id="bt-model" type="text" placeholder="current" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm text-gray-200">
+          </div>
+          <div>
+            <label class="text-xs text-gray-500 block mb-1">Step (1 = every day, 3 = every 3rd)</label>
+            <input id="bt-step" type="number" value="1" min="1" max="10" class="w-full bg-card2 border border-border rounded-lg px-3 py-2 text-sm text-gray-200">
+          </div>
+        </div>
+        <button id="bt-run" class="w-full bg-ml/20 border border-ml/30 text-ml rounded-lg px-4 py-2 text-sm font-semibold hover:bg-ml/30 transition mt-2">Start Backtest</button>
+        <div id="bt-result" class="text-xs text-gray-400 mt-2 hidden"></div>
+      </div>
+    </div>
+    <div class="bg-card rounded-xl border border-border p-5">
+      <div class="text-base font-semibold mb-4 text-gray-300">📋 Recent Backtest Runs</div>
+      <div id="bt-runs" class="space-y-2">
+        <div class="text-center text-gray-500 text-sm py-4">Loading...</div>
+      </div>
+    </div>
+  </div>
+  <div class="mt-4 bg-card rounded-xl border border-border p-4" id="bt-progress-container" style="display:none">
+    <div class="text-sm font-semibold mb-3 text-ml">⚡ Live Progress</div>
+    <div class="space-y-2">
+      <div class="flex justify-between text-xs">
+        <span id="bt-progress-status">Running...</span>
+        <span id="bt-progress-pct">0%</span>
+      </div>
+      <div class="w-full bg-card2 rounded h-2 overflow-hidden">
+        <div id="bt-progress-bar" class="bg-ml h-full transition-all" style="width: 0%"></div>
+      </div>
+      <div class="text-xs text-gray-500" id="bt-progress-detail"></div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /tab-content -->
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════════════════════
+const API = '/api/historical-performance';
+let currentPeriod = '90d';
+let currentTab = 'overview';
+let stocksOffset = 0;
+let tradesOffset = 0;
+let stocksLimit = 50;
+let tradesLimit = 50;
+let activeBacktestRunId = null;
+let backtestPollTimer = null;
+const charts = {};
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+function fmtPct(v, decimals = 1) {
+  if (v === null || v === undefined) return '--';
+  return (v * 100).toFixed(decimals) + '%';
+}
+
+function fmtNum(v, decimals = 2) {
+  if (v === null || v === undefined) return '--';
+  return Number(v).toFixed(decimals);
+}
+
+function fmtSigned(v, decimals = 2) {
+  if (v === null || v === undefined) return '--';
+  const n = Number(v);
+  return (n >= 0 ? '+' : '') + n.toFixed(decimals);
+}
+
+function setStatus(color, text) {
+  document.getElementById('status-dot').className = `w-2.5 h-2.5 rounded-full pulse-dot bg-${color}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TAB SWITCHING
+// ═══════════════════════════════════════════════════════════════════════════
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('tab-active'));
+    btn.classList.add('tab-active');
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+    const tab = btn.dataset.tab;
+    document.getElementById(`tab-${tab}`).classList.remove('hidden');
+    document.getElementById(`tab-${tab}`).classList.add('fade-in');
+    currentTab = tab;
+    loadTab(tab);
+
+    // CHART FIX: resize all charts in this tab after a brief delay
+    // so Chart.js can recalculate width with the now-visible container
+    setTimeout(() => {
+      Object.values(charts).forEach(c => {
+        if (c && typeof c.resize === 'function') {
+          try { c.resize(); } catch(e) {}
+        }
+      });
+    }, 50);
+  });
+});
+
+function loadTab(tab) {
+  if (tab === 'overview') loadOverview();
+  else if (tab === 'stocks') loadStocks();
+  else if (tab === 'trades') loadTrades();
+  else if (tab === 'models') loadModels();
+  else if (tab === 'trends') loadTrends();
+  else if (tab === 'backtest') loadBacktestRuns();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  OVERVIEW
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadOverview() {
+  try {
+    document.getElementById('overview-loading').classList.remove('hidden');
+    document.getElementById('overview-content').classList.add('hidden');
+    const data = await fetchJSON(`${API}/dashboard?period=${currentPeriod}`);
+    document.getElementById('overview-loading').classList.add('hidden');
+    document.getElementById('overview-content').classList.remove('hidden');
+
+    const s = data.summary || {};
+    document.getElementById('stat-hit-rate').textContent = s.hit_rate !== null ? fmtPct(s.hit_rate) : '--';
+    document.getElementById('stat-hit-detail').textContent = `${s.hits || 0} hits / ${s.misses || 0} misses`;
+    document.getElementById('stat-dir-acc').textContent = s.direction_accuracy !== null ? fmtPct(s.direction_accuracy) : '--';
+    document.getElementById('stat-avg-return').textContent = s.avg_return !== null ? fmtSigned(s.avg_return) + '%' : '--';
+    document.getElementById('stat-sharpe').textContent = s.sharpe_ratio !== null ? fmtNum(s.sharpe_ratio) : '--';
+    document.getElementById('stat-total').textContent = (data.total_predictions || 0).toLocaleString();
+    document.getElementById('stat-hits').textContent = (data.status_counts?.HIT || 0).toLocaleString();
+    document.getElementById('stat-misses').textContent = (data.status_counts?.MISSED || 0).toLocaleString();
+    document.getElementById('stat-running').textContent = (data.status_counts?.RUNNING || 0).toLocaleString();
+
+    // Top / bottom stocks
+    document.getElementById('top-stocks').innerHTML = (data.top_stocks || []).map(s => `
+      <div class="flex justify-between items-center p-2 bg-card2 rounded">
+        <span class="font-mono text-sm">${s.scope_id || s.ticker}</span>
+        <span class="text-bull font-mono text-sm">${fmtPct(s.hit_rate)}</span>
+      </div>
+    `).join('') || '<div class="text-gray-500 text-xs">No data</div>';
+
+    document.getElementById('bottom-stocks').innerHTML = (data.bottom_stocks || []).map(s => `
+      <div class="flex justify-between items-center p-2 bg-card2 rounded">
+        <span class="font-mono text-sm">${s.scope_id || s.ticker}</span>
+        <span class="text-bear font-mono text-sm">${fmtPct(s.hit_rate)}</span>
+      </div>
+    `).join('') || '<div class="text-gray-500 text-xs">No data</div>';
+
+    // Charts
+    drawHitRateChart(data.trend || []);
+    drawPredVsActualChart(data.trend || []);
+    setStatus('bull', 'ok');
+  } catch (e) {
+    document.getElementById('overview-loading').innerHTML = `<div class="text-danger">Error: ${e.message}</div>`;
+    setStatus('bear', 'error');
+  }
+}
+
+function drawHitRateChart(trend) {
+  const ctx = document.getElementById('chart-hit-rate');
+  if (charts.hitRate) charts.hitRate.destroy();
+  if (!trend.length) return;
+  charts.hitRate = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: trend.map(t => t.period),
+      datasets: [{
+        label: 'Hit Rate',
+        data: trend.map(t => t.hit_rate ? (t.hit_rate * 100) : null),
+        borderColor: '#00e5a0', backgroundColor: 'rgba(0,229,160,0.1)',
+        tension: 0.3, fill: true,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { ticks: { color: '#94a3b8', callback: v => v + '%' }, grid: { color: '#1a2d4a' } },
+                x: { ticks: { color: '#94a3b8', maxRotation: 0, autoSkip: true }, grid: { color: '#1a2d4a' } } }
+    }
+  });
+}
+
+function drawPredVsActualChart(trend) {
+  const ctx = document.getElementById('chart-pred-vs-actual');
+  if (charts.predVsActual) charts.predVsActual.destroy();
+  if (!trend.length) return;
+  charts.predVsActual = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: trend.map(t => t.period),
+      datasets: [
+        { label: 'Predicted', data: trend.map(t => t.avg_predicted), borderColor: '#a78bfa', tension: 0.3, fill: false },
+        { label: 'Actual', data: trend.map(t => t.avg_return), borderColor: '#00b8d4', tension: 0.3, fill: false },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#94a3b8' } } },
+      scales: { y: { ticks: { color: '#94a3b8', callback: v => v + '%' }, grid: { color: '#1a2d4a' } },
+                x: { ticks: { color: '#94a3b8', maxRotation: 0, autoSkip: true }, grid: { color: '#1a2d4a' } } }
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  STOCKS
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadStocks() {
+  try {
+    const sort = document.getElementById('stock-sort').value;
+    const minPred = document.getElementById('stock-min-pred').value;
+    const url = `${API}/stocks?period=${currentPeriod}&sort=${sort}&limit=${stocksLimit}&offset=${stocksOffset}&min_predictions=${minPred}`;
+    const data = await fetchJSON(url);
+    document.getElementById('stock-count').textContent = `${data.total} stocks`;
+    document.getElementById('stocks-pagination-info').textContent = `Showing ${data.offset + 1}-${Math.min(data.offset + data.limit, data.total)} of ${data.total}`;
+    document.getElementById('stocks-prev').disabled = data.offset === 0;
+    document.getElementById('stocks-next').disabled = data.offset + data.limit >= data.total;
+
+    const tbody = document.getElementById('stocks-tbody');
+    if (!data.stocks.length) {
+      tbody.innerHTML = '<tr><td colspan="11" class="p-8 text-center text-gray-500">No stocks found. Run a backtest first.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.stocks.map(s => `
+      <tr class="border-b border-border/50 hover:bg-card2/50 cursor-pointer" onclick="window.open('/api/historical-performance/stocks/${s.scope_id}', '_blank')">
+        <td class="p-3 font-mono font-semibold text-ml">${s.scope_id}</td>
+        <td class="p-3 text-right font-mono">${s.total_predictions}</td>
+        <td class="p-3 text-right font-mono text-bull">${s.hits}</td>
+        <td class="p-3 text-right font-mono text-bear">${s.misses}</td>
+        <td class="p-3 text-right font-mono ${s.hit_rate > 0.4 ? 'text-bull' : s.hit_rate < 0.3 ? 'text-bear' : ''}">${fmtPct(s.hit_rate)}</td>
+        <td class="p-3 text-right font-mono ${s.avg_return > 0 ? 'text-bull' : 'text-bear'}">${fmtSigned(s.avg_return)}%</td>
+        <td class="p-3 text-right font-mono">${fmtPct(s.direction_accuracy)}</td>
+        <td class="p-3 text-right font-mono">${fmtNum(s.profit_factor)}</td>
+        <td class="p-3 text-right font-mono">${fmtNum(s.sharpe_ratio)}</td>
+        <td class="p-3 text-right font-mono text-bull">${fmtSigned(s.best_trade_pct)}%</td>
+        <td class="p-3 text-right font-mono text-bear">${fmtSigned(s.worst_trade_pct)}%</td>
+      </tr>
+    `).join('');
+  } catch (e) {
+    document.getElementById('stocks-tbody').innerHTML = `<tr><td colspan="11" class="p-8 text-center text-danger">Error: ${e.message}</td></tr>`;
+  }
+}
+
+document.getElementById('stock-sort').addEventListener('change', () => { stocksOffset = 0; loadStocks(); });
+document.getElementById('stock-min-pred').addEventListener('change', () => { stocksOffset = 0; loadStocks(); });
+document.getElementById('stocks-prev').addEventListener('click', () => { stocksOffset = Math.max(0, stocksOffset - stocksLimit); loadStocks(); });
+document.getElementById('stocks-next').addEventListener('click', () => { stocksOffset += stocksLimit; loadStocks(); });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TRADES
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadTrades() {
+  try {
+    const ticker = document.getElementById('trade-ticker').value.trim();
+    const status = document.getElementById('trade-status').value;
+    const start = document.getElementById('trade-start').value;
+    const end = document.getElementById('trade-end').value;
+    let url = `${API}/trades?limit=${tradesLimit}&offset=${tradesOffset}`;
+    if (ticker) url += `&ticker=${ticker}`;
+    if (status) url += `&status=${status}`;
+    if (start) url += `&start_date=${start}`;
+    if (end) url += `&end_date=${end}`;
+    const data = await fetchJSON(url);
+    document.getElementById('trade-count').textContent = `${data.total} trades`;
+    document.getElementById('trades-pagination-info').textContent = `Page ${data.page} of ${data.pages}`;
+    document.getElementById('trades-prev').disabled = data.offset === 0;
+    document.getElementById('trades-next').disabled = data.offset + data.limit >= data.total;
+
+    const tbody = document.getElementById('trades-tbody');
+    if (!data.trades.length) {
+      tbody.innerHTML = '<tr><td colspan="10" class="p-8 text-center text-gray-500">No trades found</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.trades.map(t => {
+      const statusBadge = {
+        HIT: '<span class="badge badge-hit">HIT</span>',
+        MISSED: '<span class="badge badge-missed">MISS</span>',
+        RUNNING: '<span class="badge badge-running">RUN</span>',
+        NO_DATA: '<span class="badge" style="background:rgba(100,116,139,0.2);color:#94a3b8">N/A</span>',
+      }[t.status] || t.status;
+      return `
+        <tr class="border-b border-border/50 hover:bg-card2/50">
+          <td class="p-3 font-mono font-semibold">${t.ticker}</td>
+          <td class="p-3 font-mono text-xs">${t.prediction_date}</td>
+          <td class="p-3 font-mono text-xs text-gray-500">${t.model_version.substring(0, 20)}</td>
+          <td class="p-3 text-right font-mono ${t.predicted_return > 0 ? 'text-bull' : 'text-bear'}">${fmtSigned(t.predicted_return)}%</td>
+          <td class="p-3 text-right font-mono ${t.actual_return > 0 ? 'text-bull' : 'text-bear'}">${t.actual_return !== null ? fmtSigned(t.actual_return) + '%' : '--'}</td>
+          <td class="p-3 text-right font-mono text-bull">${t.actual_max_gain !== null ? fmtSigned(t.actual_max_gain) + '%' : '--'}</td>
+          <td class="p-3 text-right font-mono text-bear">${t.actual_max_loss !== null ? fmtSigned(t.actual_max_loss) + '%' : '--'}</td>
+          <td class="p-3 text-center">${statusBadge}</td>
+          <td class="p-3 text-right font-mono">${t.actual_days_to_target || '--'}</td>
+          <td class="p-3 text-right font-mono ${t.pnl_pct > 0 ? 'text-bull' : 'text-bear'}">${t.pnl_pct !== null ? fmtSigned(t.pnl_pct) + '%' : '--'}</td>
+        </tr>
+      `;
+    }).join('');
+  } catch (e) {
+    document.getElementById('trades-tbody').innerHTML = `<tr><td colspan="10" class="p-8 text-center text-danger">Error: ${e.message}</td></tr>`;
+  }
+}
+
+document.getElementById('trade-apply').addEventListener('click', () => { tradesOffset = 0; loadTrades(); });
+document.getElementById('trades-prev').addEventListener('click', () => { tradesOffset = Math.max(0, tradesOffset - tradesLimit); loadTrades(); });
+document.getElementById('trades-next').addEventListener('click', () => { tradesOffset += tradesLimit; loadTrades(); });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  MODELS
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadModels() {
+  try {
+    document.getElementById('models-loading').classList.remove('hidden');
+    document.getElementById('models-content').classList.add('hidden');
+    const data = await fetchJSON(`${API}/models?period=${currentPeriod}`);
+    document.getElementById('models-loading').classList.add('hidden');
+    document.getElementById('models-content').classList.remove('hidden');
+
+    const tbody = document.getElementById('models-tbody');
+    if (!data.models.length) {
+      tbody.innerHTML = '<tr><td colspan="10" class="p-8 text-center text-gray-500">No model versions yet. Run backtests with different model versions.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.models.map(m => `
+      <tr class="border-b border-border/50 ${m.is_production ? 'bg-bull/5' : ''}">
+        <td class="p-3 font-mono text-xs">${m.scope_id}</td>
+        <td class="p-3 text-center">${m.is_production ? '<span class="badge badge-prod">PROD</span>' : ''}</td>
+        <td class="p-3 text-right font-mono">${m.total_predictions}</td>
+        <td class="p-3 text-right font-mono ${m.hit_rate > 0.4 ? 'text-bull' : ''}">${fmtPct(m.hit_rate)}</td>
+        <td class="p-3 text-right font-mono">${fmtPct(m.direction_accuracy)}</td>
+        <td class="p-3 text-right font-mono">${fmtNum(m.return_mae)}</td>
+        <td class="p-3 text-right font-mono ${m.profit_factor > 1.5 ? 'text-bull' : ''}">${fmtNum(m.profit_factor)}</td>
+        <td class="p-3 text-right font-mono ${m.sharpe_ratio > 1 ? 'text-bull' : ''}">${fmtNum(m.sharpe_ratio)}</td>
+        <td class="p-3 text-right font-mono text-bull">${fmtSigned(m.best_trade_pct)}%</td>
+        <td class="p-3 text-right font-mono text-bear">${fmtSigned(m.worst_trade_pct)}%</td>
+      </tr>
+    `).join('');
+
+    // Comparison chart
+    drawModelsChart(data.models);
+  } catch (e) {
+    document.getElementById('models-loading').innerHTML = `<div class="text-danger">Error: ${e.message}</div>`;
+  }
+}
+
+function drawModelsChart(models) {
+  const ctx = document.getElementById('chart-models');
+  if (charts.models) charts.models.destroy();
+  if (!models.length) return;
+  // Shorten version names for display
+  const labels = models.map(m => m.scope_id.split('_').slice(-2).join('_').substring(0, 15));
+  charts.models = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: 'Hit Rate %', data: models.map(m => m.hit_rate ? m.hit_rate * 100 : 0), backgroundColor: 'rgba(0,229,160,0.6)' },
+        { label: 'Direction Acc %', data: models.map(m => m.direction_accuracy ? m.direction_accuracy * 100 : 0), backgroundColor: 'rgba(0,184,212,0.6)' },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#94a3b8' } } },
+      scales: { y: { ticks: { color: '#94a3b8', callback: v => v + '%' }, grid: { color: '#1a2d4a' } },
+                x: { ticks: { color: '#94a3b8' }, grid: { color: '#1a2d4a' } } }
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  TRENDS
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadTrends() {
+  try {
+    document.getElementById('trends-loading').classList.remove('hidden');
+    document.getElementById('trends-content').classList.add('hidden');
+    const bucket = document.getElementById('trend-bucket').value;
+    const days = document.getElementById('trend-days').value;
+    const data = await fetchJSON(`${API}/trend?bucket=${bucket}&days=${days}`);
+    document.getElementById('trends-loading').classList.add('hidden');
+    document.getElementById('trends-content').classList.remove('hidden');
+
+    const t = data.buckets || [];
+    drawTrendHitChart(t);
+    drawTrendReturnsChart(t);
+    drawTrendAccChart(t);
+  } catch (e) {
+    document.getElementById('trends-loading').innerHTML = `<div class="text-danger">Error: ${e.message}</div>`;
+  }
+}
+
+function drawTrendHitChart(trend) {
+  const ctx = document.getElementById('chart-trend-hit');
+  if (charts.trendHit) charts.trendHit.destroy();
+  if (!trend.length) return;
+  charts.trendHit = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: trend.map(t => t.period),
+      datasets: [{
+        label: 'Hit Rate', data: trend.map(t => t.hit_rate ? t.hit_rate * 100 : null),
+        borderColor: '#00e5a0', backgroundColor: 'rgba(0,229,160,0.1)', tension: 0.3, fill: true,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { ticks: { color: '#94a3b8', callback: v => v + '%' }, grid: { color: '#1a2d4a' } },
+                x: { ticks: { color: '#94a3b8', maxRotation: 0, autoSkip: true }, grid: { color: '#1a2d4a' } } }
+    }
+  });
+}
+
+function drawTrendReturnsChart(trend) {
+  const ctx = document.getElementById('chart-trend-returns');
+  if (charts.trendReturns) charts.trendReturns.destroy();
+  if (!trend.length) return;
+  charts.trendReturns = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: trend.map(t => t.period),
+      datasets: [
+        { label: 'Predicted', data: trend.map(t => t.avg_predicted), borderColor: '#a78bfa', tension: 0.3, fill: false },
+        { label: 'Actual', data: trend.map(t => t.avg_return), borderColor: '#00b8d4', tension: 0.3, fill: false },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#94a3b8' } } },
+      scales: { y: { ticks: { color: '#94a3b8', callback: v => v + '%' }, grid: { color: '#1a2d4a' } },
+                x: { ticks: { color: '#94a3b8', maxRotation: 0, autoSkip: true }, grid: { color: '#1a2d4a' } } }
+    }
+  });
+}
+
+function drawTrendAccChart(trend) {
+  const ctx = document.getElementById('chart-trend-acc');
+  if (charts.trendAcc) charts.trendAcc.destroy();
+  if (!trend.length) return;
+  charts.trendAcc = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: trend.map(t => t.period),
+      datasets: [
+        { label: 'Direction Acc %', data: trend.map(t => t.direction_acc ? t.direction_acc * 100 : null), borderColor: '#00b8d4', yAxisID: 'y', tension: 0.3 },
+        { label: 'Return MAE', data: trend.map(t => t.return_mae), borderColor: '#f59e0b', yAxisID: 'y1', tension: 0.3 },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#94a3b8' } } },
+      scales: {
+        y: { type: 'linear', position: 'left', ticks: { color: '#94a3b8', callback: v => v + '%' }, grid: { color: '#1a2d4a' } },
+        y1: { type: 'linear', position: 'right', ticks: { color: '#f59e0b' }, grid: { drawOnChartArea: false } },
+        x: { ticks: { color: '#94a3b8', maxRotation: 0, autoSkip: true }, grid: { color: '#1a2d4a' } }
+      }
+    }
+  });
+}
+
+document.getElementById('trend-bucket').addEventListener('change', loadTrends);
+document.getElementById('trend-days').addEventListener('change', loadTrends);
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BACKTEST
+// ═══════════════════════════════════════════════════════════════════════════
+async function loadBacktestRuns() {
+  try {
+    const data = await fetchJSON(`${API}/backtest?limit=10`);
+    const el = document.getElementById('bt-runs');
+    if (!data.runs.length) {
+      el.innerHTML = '<div class="text-center text-gray-500 text-sm py-4">No backtests yet</div>';
+      return;
+    }
+    el.innerHTML = data.runs.map(r => `
+      <div class="p-3 bg-card2 rounded border-l-2 ${r.status === 'completed' ? 'border-bull' : r.status === 'failed' ? 'border-bear' : r.status === 'running' ? 'border-ml' : 'border-gray-600'}">
+        <div class="flex justify-between items-start">
+          <div>
+            <div class="font-mono text-xs text-gray-400">#${r.id} • ${r.run_type}</div>
+            <div class="font-mono text-sm">${r.model_version.substring(0, 30)}</div>
+            <div class="text-xs text-gray-500 mt-1">${r.start_date} → ${r.end_date} • ${r.tickers_count} tickers</div>
+          </div>
+          <div class="text-right">
+            <span class="badge ${r.status === 'completed' ? 'badge-hit' : r.status === 'failed' ? 'badge-missed' : 'badge-running'}">${r.status.toUpperCase()}</span>
+            <div class="text-xs text-gray-500 mt-1">${r.predictions_generated} preds</div>
+            <div class="text-xs text-gray-600">${r.duration_seconds ? r.duration_seconds + 's' : ''}</div>
+          </div>
+        </div>
+        ${r.status === 'running' ? `<div class="mt-2 text-xs text-ml">Processing: ${r.current_ticker} @ ${r.current_date} (${r.progress_pct}%)</div>` : ''}
+        ${r.error_message ? `<div class="mt-2 text-xs text-danger">${r.error_message}</div>` : ''}
+      </div>
+    `).join('');
+  } catch (e) {
+    document.getElementById('bt-runs').innerHTML = `<div class="text-danger text-sm">Error: ${e.message}</div>`;
+  }
+}
+
+document.getElementById('bt-run').addEventListener('click', async () => {
+  const tickers = document.getElementById('bt-tickers').value.trim();
+  const startDate = document.getElementById('bt-start').value;
+  const endDate = document.getElementById('bt-end').value;
+  const modelVersion = document.getElementById('bt-model').value.trim();
+  const step = parseInt(document.getElementById('bt-step').value) || 1;
+
+  const body = {
+    step: step,
+    run_type: 'manual',
+  };
+  if (tickers) body.tickers = tickers.split(',').map(t => t.trim()).filter(Boolean);
+  if (startDate) body.start_date = startDate;
+  if (endDate) body.end_date = endDate;
+  if (modelVersion) body.model_version = modelVersion;
+
+  try {
+    document.getElementById('bt-run').disabled = true;
+    document.getElementById('bt-run').textContent = 'Starting...';
+    const r = await fetch(`${API}/backtest`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (r.ok) {
+      document.getElementById('bt-result').classList.remove('hidden');
+      document.getElementById('bt-result').innerHTML = `<div class="text-bull">✓ Started run #${data.run_id} — ${data.tickers_count} tickers, ${data.start_date} to ${data.end_date}</div>`;
+      activeBacktestRunId = data.run_id;
+      document.getElementById('bt-progress-container').style.display = 'block';
+      pollBacktestProgress();
+    } else {
+      document.getElementById('bt-result').classList.remove('hidden');
+      document.getElementById('bt-result').innerHTML = `<div class="text-danger">✗ ${data.detail || 'Failed'}</div>`;
+    }
+  } catch (e) {
+    document.getElementById('bt-result').classList.remove('hidden');
+    document.getElementById('bt-result').innerHTML = `<div class="text-danger">✗ ${e.message}</div>`;
+  } finally {
+    document.getElementById('bt-run').disabled = false;
+    document.getElementById('bt-run').textContent = 'Start Backtest';
+  }
+});
+
+function pollBacktestProgress() {
+  if (backtestPollTimer) clearInterval(backtestPollTimer);
+  backtestPollTimer = setInterval(async () => {
+    if (!activeBacktestRunId) {
+      clearInterval(backtestPollTimer);
+      return;
+    }
+    try {
+      const p = await fetchJSON(`${API}/backtest/${activeBacktestRunId}`);
+      document.getElementById('bt-progress-status').textContent = `${p.status}: ${p.current_ticker || ''} ${p.current_date || ''}`;
+      document.getElementById('bt-progress-pct').textContent = `${p.progress_pct}%`;
+      document.getElementById('bt-progress-bar').style.width = `${p.progress_pct}%`;
+      document.getElementById('bt-progress-detail').textContent =
+        `${p.predictions_generated} predictions • ${p.predictions_skipped} skipped • ${p.elapsed_seconds || 0}s`;
+      if (p.status === 'completed' || p.status === 'failed' || p.status === 'cancelled') {
+        clearInterval(backtestPollTimer);
+        loadBacktestRuns();
+        if (p.status === 'completed') {
+          // Trigger aggregation
+          fetch(`${API}/aggregate`, { method: 'POST' });
+        }
+      }
+    } catch (e) {
+      console.error('Progress poll failed:', e);
+    }
+  }, 2000);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  GLOBAL CONTROLS
+// ═══════════════════════════════════════════════════════════════════════════
+document.getElementById('period-select').value = currentPeriod;
+document.getElementById('period-select').addEventListener('change', (e) => {
+  currentPeriod = e.target.value;
+  loadTab(currentTab);
+});
+
+document.getElementById('refresh-btn').addEventListener('click', () => {
+  loadTab(currentTab);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CLEAR DATA BUTTON + MODAL
+// ═══════════════════════════════════════════════════════════════════════════
+async function openClearModal() {
+  document.getElementById('clear-modal').style.display = 'flex';
+  document.getElementById('clear-result').classList.add('hidden');
+  document.getElementById('clear-confirm-check').checked = false;
+  document.getElementById('clear-execute-btn').disabled = true;
+  document.getElementById('clear-preview-content').innerHTML = '<div class="text-gray-500">Loading preview...</div>';
+
+  // Fetch preview data
+  try {
+    const data = await fetchJSON(`${API}/clear/preview`);
+    let html = '';
+    if (data.total_rows === 0) {
+      html = '<div class="text-gray-500">No data to delete — all tables are empty.</div>';
+      document.getElementById('clear-execute-btn').disabled = true;
+    } else {
+      html += '<div class="grid grid-cols-3 gap-2 mb-3">';
+      html += `<div class="bg-card3 rounded p-2 text-center"><div class="text-gray-500 text-xs">Predictions</div><div class="text-bull font-bold">${(data.tables.historical_predictions || 0).toLocaleString()}</div></div>`;
+      html += `<div class="bg-card3 rounded p-2 text-center"><div class="text-gray-500 text-xs">Accuracy Stats</div><div class="text-ml font-bold">${(data.tables.historical_accuracy || 0).toLocaleString()}</div></div>`;
+      html += `<div class="bg-card3 rounded p-2 text-center"><div class="text-gray-500 text-xs">Backtest Runs</div><div class="text-warn font-bold">${(data.tables.backtest_runs || 0).toLocaleString()}</div></div>`;
+      html += '</div>';
+      html += `<div class="text-gray-400 text-xs">Total rows: <span class="text-danger font-bold">${data.total_rows.toLocaleString()}</span></div>`;
+      if (data.top_tickers && data.top_tickers.length > 0) {
+        html += '<div class="mt-3 text-gray-500 text-xs">Top tickers:</div>';
+        html += '<div class="flex flex-wrap gap-1 mt-1">';
+        data.top_tickers.slice(0, 5).forEach(t => {
+          html += `<span class="bg-card3 px-2 py-0.5 rounded text-xs">${t.ticker} (${t.count})</span>`;
+        });
+        html += '</div>';
+      }
+      if (data.models && data.models.length > 0) {
+        html += '<div class="mt-3 text-gray-500 text-xs">Model versions:</div>';
+        html += '<div class="flex flex-wrap gap-1 mt-1">';
+        data.models.forEach(m => {
+          html += `<span class="bg-card3 px-2 py-0.5 rounded text-xs font-mono">${m.model_version.substring(0, 25)} (${m.count})</span>`;
+        });
+        html += '</div>';
+      }
+    }
+    document.getElementById('clear-preview-content').innerHTML = html;
+  } catch (e) {
+    document.getElementById('clear-preview-content').innerHTML = `<div class="text-danger">Error loading preview: ${e.message}</div>`;
+  }
+}
+
+function closeClearModal() {
+  document.getElementById('clear-modal').style.display = 'none';
+}
+
+document.getElementById('clear-data-btn').addEventListener('click', openClearModal);
+
+// Enable/disable the delete button based on checkbox
+document.getElementById('clear-confirm-check').addEventListener('change', (e) => {
+  document.getElementById('clear-execute-btn').disabled = !e.target.checked;
+});
+
+// Execute the clear
+document.getElementById('clear-execute-btn').addEventListener('click', async () => {
+  const scope = document.getElementById('clear-scope').value;
+  const resultDiv = document.getElementById('clear-result');
+  const btn = document.getElementById('clear-execute-btn');
+
+  btn.disabled = true;
+  btn.textContent = 'Deleting...';
+  resultDiv.classList.remove('hidden');
+  resultDiv.className = 'mt-4 p-3 rounded-lg text-sm bg-warn/10 text-warn';
+  resultDiv.textContent = `Deleting ${scope} data...`;
+
+  // Try DELETE first, fall back to POST if DELETE returns 405/404
+  const url = `${API}/clear?scope=${scope}&confirm=true`;
+  let r = null;
+  let data = null;
+  try {
+    r = await fetch(url, { method: 'DELETE' });
+    if (r.status === 404 || r.status === 405) {
+      // Fall back to POST
+      r = await fetch(url, { method: 'POST' });
+    }
+    data = await r.json();
+  } catch (e) {
+    // Network error — try POST as last resort
+    try {
+      r = await fetch(url, { method: 'POST' });
+      data = await r.json();
+    } catch (e2) {
+      resultDiv.className = 'mt-4 p-3 rounded-lg text-sm bg-danger/10 text-danger';
+      resultDiv.textContent = `✗ Error: ${e2.message}`;
+      btn.disabled = false;
+      btn.textContent = '🗑 Delete Permanently';
+      return;
+    }
+  }
+
+  if (r && r.ok && data && data.status === 'success') {
+    resultDiv.className = 'mt-4 p-3 rounded-lg text-sm bg-bull/10 text-bull';
+    resultDiv.innerHTML = `✓ ${data.message}<br>Deleted: ${data.total_deleted.toLocaleString()} rows`;
+    // Close modal after 2 seconds and refresh
+    setTimeout(() => {
+      closeClearModal();
+      loadTab(currentTab);
+    }, 2000);
+  } else {
+    resultDiv.className = 'mt-4 p-3 rounded-lg text-sm bg-danger/10 text-danger';
+    resultDiv.textContent = `✗ ${data?.detail || data?.message || 'Failed'}`;
+    btn.disabled = false;
+    btn.textContent = '🗑 Delete Permanently';
+  }
+});
+
+// Close modal when clicking outside
+document.getElementById('clear-modal').addEventListener('click', (e) => {
+  if (e.target.id === 'clear-modal') closeClearModal();
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Set default dates for backtest form
+const today = new Date();
+const tenYearsAgo = new Date();
+tenYearsAgo.setFullYear(tenYearsAgo.getFullYear() - 10);
+document.getElementById('bt-end').value = today.toISOString().split('T')[0];
+document.getElementById('bt-start').value = tenYearsAgo.toISOString().split('T')[0];
+
+// Initial load — slight delay to ensure DOM + Tailwind are fully loaded
+setTimeout(() => {
+  loadOverview();
+  // Resize any charts after they're created
+  setTimeout(() => {
+    Object.values(charts).forEach(c => {
+      if (c && typeof c.resize === 'function') {
+        try { c.resize(); } catch(e) {}
+      }
+    });
+  }, 200);
+}, 100);
+
+// Auto-refresh every 60s
+setInterval(loadTab, 60000);
+
+// CHART FIX: resize all charts when window is resized
+let resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    Object.values(charts).forEach(c => {
+      if (c && typeof c.resize === 'function') {
+        try { c.resize(); } catch(e) {}
+      }
+    });
+  }, 150);
+});
+</script>
+
+</body>
+</html>

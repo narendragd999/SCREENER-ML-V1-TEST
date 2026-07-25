@@ -20,7 +20,7 @@ echo ======================================
 
 
 D:
-cd /d "E:\application\Office-Scripts\SCRIPTS\SCREENER-ML-V1-TEST"
+cd /d "E:\application\Office-Scripts\SCRIPTS\SCREENER-ML-V1-TEST-01"
 
 python ml_service/ml_service.py
 

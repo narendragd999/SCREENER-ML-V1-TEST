@@ -10,6 +10,18 @@
 <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 
 <script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind = { config: { corePlugins: { preflight: false } } };</script>
+<script>
+// Suppress Tailwind CDN production warning
+if (typeof console !== 'undefined' && console.warn) {
+  const _origWarn = console.warn;
+  console.warn = function(...args) {
+    const msg = args && args[0];
+    if (typeof msg === 'string' && msg.includes('cdn.tailwindcss.com should not be used in production')) return;
+    return _origWarn.apply(console, args);
+  };
+}
+</script>
 <script src="https://cdn.jsdelivr.net/npm/tailwindcss-cdn@3.4.16/tailwindcss.min.js" onerror="void(0)"></script>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 
@@ -45,6 +57,172 @@ tailwind.config = {
     min-height: 100vh;
   }
   .font-mono { font-family: 'JetBrains Mono', monospace; }
+
+  /* ═══════ CHARTINK TAB — Section Toggle Pills ═══════ */
+  .ck-toggle-pill {
+    font-family: 'Exo 2', sans-serif;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    border: 1px solid rgba(26,45,74,0.5);
+    background: rgba(15,29,50,0.6);
+    color: #64748b;
+    user-select: none;
+    white-space: nowrap;
+  }
+  .ck-toggle-pill:hover { border-color: rgba(100,116,139,0.5); color: #94a3b8; }
+  .ck-toggle-pill.active { color: #e2e8f0; border-color: rgba(0,229,160,0.3); background: rgba(0,229,160,0.08); }
+  .ck-toggle-pill .pill-count { margin-left: 4px; font-size: 10px; opacity: 0.7; font-family: 'JetBrains Mono', monospace; }
+  /* ── Section collapse animation ── */
+  .ck-section-body { max-height: 5000px; overflow: hidden; opacity: 1; transition: max-height 0.3s ease, opacity 0.2s ease; }
+  .ck-section-body.collapsed { max-height: 0; opacity: 0; pointer-events: none; }
+  .ck-section-chevron { transition: transform 0.2s ease; display: inline-block; }
+  .ck-section-chevron.rotated { transform: rotate(-90deg); }
+  /* ── Compact stat cards ── */
+  .ck-stat-compact { padding: 8px 6px; text-align: center; }
+  .ck-stat-compact .stat-val { font-family: 'JetBrains Mono', monospace; font-size: 1.15rem; font-weight: 700; line-height: 1.2; }
+  .ck-stat-compact .stat-label { font-family: 'Exo 2', sans-serif; font-size: 10px; color: #64748b; margin-top: 2px; }
+  /* ── Momentum config collapse ── */
+  .ck-ms-config-body { max-height: 200px; overflow: hidden; opacity: 1; transition: max-height 0.3s ease, opacity 0.2s ease; }
+  .ck-ms-config-body.collapsed { max-height: 0; opacity: 0; }
+
+
+  /* Fix chartink symbol list overflow */
+  #chartinkSymbolList {
+    display: inline-block !important;
+    max-width: 120px !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+    vertical-align: bottom !important;
+  }
+  /* ═══════ COMPACT DESIGN SYSTEM ═══════ */
+  :root {
+    --ck-font-size: 11px;
+    --ck-header-font-size: 13px;
+    --ck-cell-padding-x: 8px;
+    --ck-cell-padding-y: 4px;
+    --ck-header-padding-x: 8px;
+    --ck-header-padding-y: 5px;
+  }
+
+  #chartinkPanel table { font-size: var(--ck-font-size); }
+  #chartinkPanel table thead th {
+    font-size: 10px;
+    padding: var(--ck-header-padding-y) var(--ck-header-padding-x) !important;
+    white-space: nowrap;
+  }
+  #chartinkPanel table tbody td {
+    padding: var(--ck-cell-padding-y) var(--ck-cell-padding-x) !important;
+  }
+
+  /* Compact section headers */
+  #chartinkPanel .ck-card-header {
+    padding: 6px 10px !important;
+    gap: 6px !important;
+    min-height: 32px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s ease;
+  }
+  #chartinkPanel .ck-card-header:hover {
+    background: rgba(255,255,255,0.02);
+  }
+  #chartinkPanel .ck-card-header h2 {
+    font-size: var(--ck-header-font-size) !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.02em;
+  }
+  #chartinkPanel .ck-card-header .section-count-badge {
+    font-size: 10px;
+  }
+  #chartinkPanel .ck-card-header .section-desc {
+    font-size: 10px;
+    display: none;
+  }
+  #chartinkPanel .ck-card-header .text-lg { font-size: 14px; }
+
+  /* Collapsible body */
+  .ck-collapsible-body {
+    max-height: 8000px;
+    overflow: hidden;
+    opacity: 1;
+    transition: max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 0.2s ease,
+                padding 0.3s ease;
+  }
+  .ck-collapsible-body.collapsed {
+    max-height: 0;
+    opacity: 0;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+  }
+
+  /* Collapsible chevron */
+  .ck-collapse-chevron {
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+  }
+  .ck-collapse-chevron.collapsed {
+    transform: rotate(-90deg);
+  }
+
+  /* Compact stat cards */
+  #chartinkPanel .ck-stat-compact {
+    padding: 5px 4px !important;
+  }
+  #chartinkPanel .ck-stat-compact .stat-val {
+    font-size: 0.95rem !important;
+  }
+
+  /* Compact glass cards in chartink panel */
+  #chartinkPanel .glass-card {
+    border-radius: 10px !important;
+  }
+
+  /* Compact sort selects and export buttons */
+  #chartinkPanel .ck-card-header select {
+    font-size: 10px !important;
+    padding: 1px 6px !important;
+    max-width: 160px;
+  }
+  #chartinkPanel .ck-card-header button.export-btn {
+    padding: 2px 8px !important;
+    font-size: 10px !important;
+  }
+
+  /* Font-size selector */
+  .ck-font-selector {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    background: rgba(15,29,50,0.8);
+    border: 1px solid rgba(26,45,74,0.5);
+    color: #94a3b8;
+    padding: 2px 4px;
+    border-radius: 5px;
+    cursor: pointer;
+    outline: none;
+  }
+  .ck-font-selector:focus {
+    border-color: rgba(0,229,160,0.3);
+  }
+
+  /* Compact control bar */
+  #chartinkPanel .ck-control-bar {
+    padding: 8px 10px !important;
+  }
+  #chartinkPanel .ck-control-bar h2 {
+    font-size: 12px !important;
+  }
+
 
   .upload-zone {
     border: 2px dashed #1a2d4a;
@@ -367,6 +545,19 @@ tailwind.config = {
           title="Stocks whose current price is within ±2% of a multi-touch horizontal support level (3+ touches over 120d / 500d).">
           🎯 Near Support
         </button>
+        <div class="w-px h-5 bg-border/50 mx-1"></div>
+        <a href="http://localhost:8001/stock-analysis" target="_blank" rel="noopener"
+          class="tab-btn px-3 py-1.5 rounded-md font-ui text-xs font-600 transition-all duration-200 flex items-center gap-1.5 hover:bg-accent2/10 text-slate-400 hover:text-accent2 no-underline"
+          title="Stock Analysis — detailed fundamental & technical analysis (opens in new tab)">
+          📈 Analysis
+          <svg class="w-2.5 h-2.5 opacity-50" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/></svg>
+        </a>
+        <a href="http://localhost:8001/historical-performance" target="_blank" rel="noopener"
+          class="tab-btn px-3 py-1.5 rounded-md font-ui text-xs font-600 transition-all duration-200 flex items-center gap-1.5 hover:bg-warn/10 text-slate-400 hover:text-warn no-underline"
+          title="Historical Performance — backtest results & strategy metrics (opens in new tab)">
+          📊 Perf
+          <svg class="w-2.5 h-2.5 opacity-50" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/></svg>
+        </a>
       </div>
       <!-- ── OPTIONS PROCESSING TOGGLE (global kill-switch) ────────────── -->
       <!-- When OFF: backend short-circuits every fetch_option_chain() call,
@@ -1022,206 +1213,265 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
 </div><!-- /screenerPanel -->
 
 <!-- ═══════════════ CHARTINK LIVE PANEL ═══════════════ -->
-<div id="chartinkPanel" class="hidden space-y-8">
+<div id="chartinkPanel" class="hidden space-y-4">
 
-  <!-- ═══════════════ CONTROL BAR ═══════════════ -->
-  <section class="glass-card rounded-2xl p-6">
-    <div class="flex items-center justify-between flex-wrap gap-4">
+  <!-- ═══════════════ CONTROL BAR (compact) ═══════════════ -->
+  <section class="glass-card rounded-xl p-3 ck-control-bar">
+    <div class="flex items-center justify-between flex-wrap gap-3">
       <div class="flex items-center gap-2">
-        <svg class="w-5 h-5 text-accent2" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+        <svg class="w-4 h-4 text-accent2" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" d="M8.288 15.038a5.25 5.25 0 017.424 0M5.106 11.856c3.807-3.808 9.98-3.808 13.788 0M1.924 8.674c5.565-5.565 14.587-5.565 20.152 0M12.53 18.22l-.53.53-.53-.53a.75.75 0 111.06 0z"/>
         </svg>
-        <h2 class="font-ui text-lg font-700 text-white">Chartink Live Feed</h2>
-        <span id="chartinkStoredCount" class="font-mono text-xs bg-accent2/10 text-accent2 px-2 py-0.5 rounded-full ml-1">0 stored</span>
-        <span class="text-xs font-mono text-slate-500 ml-2">Signals accumulate across scans &bull; EMA9 + Trend + Fair Value applied &bull; clear to reset</span>
+        <h2 class="font-ui text-sm font-700 text-white">Chartink Live Feed</h2>
+        <span id="chartinkStoredCount" class="font-mono text-[10px] bg-accent2/10 text-accent2 px-1.5 py-0.5 rounded-full">0</span>
       </div>
-      <div class="flex items-center gap-3">
-        <span id="chartinkStatusText" class="font-mono text-xs text-slate-500"></span>
+      <div class="flex items-center gap-2">
+        <span id="chartinkStatusText" class="font-mono text-[10px] text-slate-500 max-w-[300px] truncate"></span>
         <button id="chartinkScanNowBtn" onclick="runChartinkScanNow()"
-          class="px-4 py-2 rounded-lg font-ui font-600 text-xs
+          class="px-3 py-1.5 rounded-lg font-ui font-600 text-[11px]
                  bg-gradient-to-r from-accent2 to-accent text-base
                  hover:shadow-lg hover:shadow-accent2/20 transition-all duration-200
-                 flex items-center gap-2 whitespace-nowrap">
+                 flex items-center gap-1.5 whitespace-nowrap">
           <span id="chartinkScanNowText">Scan Now</span>
           <span id="chartinkScanNowSpinner" class="spinner-sm hidden"></span>
         </button>
+        <button id="chartinkScanAllBtn" onclick="runChartinkScanAll()"
+          class="px-3 py-1.5 rounded-lg font-ui font-600 text-[11px]
+                 bg-gradient-to-r from-emerald-600 to-teal-500 text-white
+                 hover:shadow-lg hover:shadow-emerald-500/30 transition-all duration-200
+                 flex items-center gap-1.5 whitespace-nowrap border border-emerald-400/30"
+          title="Scan ALL healthy NSE F&amp;O tickers — no Chartink filter. First run ~2-3 min, cached after that &lt;10s.">
+          <span id="chartinkScanAllText">Scan All 307</span>
+          <span id="chartinkScanAllSpinner" class="spinner-sm hidden"></span>
+        </button>
         <button id="chartinkClearBtn" onclick="clearChartinkResults()"
-          class="px-4 py-2 rounded-lg font-ui font-600 text-xs
+          class="px-3 py-1.5 rounded-lg font-ui font-600 text-[11px]
                  bg-card2 border border-border/50 text-slate-400
                  hover:text-danger hover:border-danger/40 transition-all duration-200"
-          title="Clear all stored signals from memory">
-          Clear All
-        </button>
+          title="Clear all stored signals">Clear All</button>
       </div>
     </div>
-    <div class="mt-4 flex items-center gap-2 flex-wrap" id="chartinkClauseSelectorRow">
-      <span class="font-mono text-xs text-slate-500 shrink-0">Active clause(s):</span>
-      <div id="chartinkClauseCheckboxes" class="flex items-center gap-2 flex-wrap"></div>
-      <button onclick="ckLoadClauseOptions()"
-        class="font-mono text-xs text-accent2 hover:underline ml-1" title="Refresh from Clause Scan tab">
-        refresh
+    <!-- Clause selector (compact) -->
+    <div class="mt-2 flex items-center gap-2 flex-wrap" id="chartinkClauseSelectorRow">
+      <span class="font-mono text-[10px] text-slate-500 shrink-0">Clauses:</span>
+      <div id="chartinkClauseCheckboxes" class="flex items-center gap-1.5 flex-wrap"></div>
+      <button onclick="ckLoadClauseOptions()" class="font-mono text-[10px] text-accent2 hover:underline">refresh</button>
+      <span id="chartinkClauseSelectorEmpty" class="hidden font-mono text-[10px] text-slate-600">No clauses — add in Clause Scan tab.</span>
+    </div>
+    <!-- Filters (compact single row) -->
+    <div class="mt-1.5 flex items-center gap-2 flex-wrap text-[10px] font-mono">
+      <label class="flex items-center gap-1 cursor-pointer select-none px-2 py-1 rounded-md bg-card2 border border-border/30 hover:border-accent/30 transition-colors"
+             title="Show only signals within ±2% of multi-touch support">
+        <input type="checkbox" id="chartinkNsFilterToggle" onchange="_ckRenderStore()" class="accent-accent w-3 h-3">
+        <span class="text-slate-400">Near-Support</span>
+        <span id="chartinkNsCount" class="text-accent">0</span>
+      </label>
+      <label class="flex items-center gap-1 cursor-pointer select-none px-2 py-1 rounded-md bg-card2 border border-border/30 hover:border-orange-400/30 transition-colors"
+             title="Show only BOTH (NS + Swing) — highest conviction">
+        <input type="checkbox" id="chartinkBothFilterToggle" onchange="_ckRenderStore()" class="accent-orange-400 w-3 h-3">
+        <span class="text-slate-400">BOTH</span>
+        <span id="chartinkBothCount" class="text-orange-400">0</span>
+      </label>
+      <label class="flex items-center gap-1 cursor-pointer select-none px-2 py-1 rounded-md bg-card2 border border-border/30 hover:border-accent2/30 transition-colors"
+             title="Show only swing-pullback setups">
+        <input type="checkbox" id="chartinkSwingFilterToggle" onchange="_ckRenderStore()" class="accent-accent2 w-3 h-3">
+        <span class="text-slate-400">Swing</span>
+        <span id="chartinkSwingCount" class="text-accent2">0</span>
+      </label>
+      <span class="text-slate-600 ml-1 inline-flex items-center gap-1 min-w-0 max-w-[340px]">
+        Last: <span id="chartinkLastRun" class="text-slate-400 shrink-0">never</span>
+        <span class="text-slate-600 shrink-0">&bull;</span>
+        Next: <span id="chartinkNextScan" class="text-accent2 shrink-0">5:00</span>
+        <span class="text-slate-600 shrink-0">&bull;</span>
+        Pulled: <span id="chartinkSymbolCount" class="text-slate-400 shrink-0">0</span>
+        <span id="chartinkSymbolList" class="text-slate-500 truncate inline-block max-w-[120px] align-bottom" title=""></span>
+      </span>
+    </div>
+
+    <!-- Font-size & Collapse controls -->
+    <div class="flex items-center gap-2 flex-wrap font-mono mt-1">
+      <span class="text-[10px] text-slate-600 shrink-0">Font:</span>
+      <select id="ckFontSizeSelect" class="ck-font-selector" onchange="ckSetFontSize(this.value)">
+        <option value="10px">10</option>
+        <option value="11px" selected>11</option>
+        <option value="12px">12</option>
+        <option value="13px">13</option>
+        <option value="14px">14</option>
+      </select>
+      <span class="text-[10px] text-slate-600 shrink-0">H:</span>
+      <select id="ckHeaderFontSelect" class="ck-font-selector" onchange="ckSetHeaderFont(this.value)">
+        <option value="11px">11</option>
+        <option value="12px">12</option>
+        <option value="13px" selected>13</option>
+        <option value="14px">14</option>
+        <option value="15px">15</option>
+      </select>
+      <button onclick="ckCollapseAll()" class="ck-toggle-pill ml-auto" title="Collapse all open sections">
+        <svg class="w-3 h-3 inline -mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
+        Collapse All
       </button>
-      <span id="chartinkClauseSelectorEmpty" class="hidden font-mono text-xs text-slate-600">
-        No saved clauses yet &mdash; add some in the Clause Scan tab.
-      </span>
-    </div>
-    <!-- ─── Near-Support filter toggle (Chartink integration) ─── -->
-    <div class="mt-3 flex items-center gap-3 flex-wrap text-xs font-mono">
-      <label class="flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-lg
-                     bg-card2 border border-border/50 hover:border-accent/40 transition-colors"
-             title="Show only Chartink signals whose current price is within ±2% of a 3+ touch horizontal support level.">
-        <input type="checkbox" id="chartinkNsFilterToggle" onchange="_ckRenderStore()"
-               class="accent-accent w-3.5 h-3.5">
-        <span class="text-slate-300">🎯 Show only Near-Support signals</span>
-        <span id="chartinkNsCount" class="ml-1 px-1.5 py-0.5 rounded bg-accent/15 text-accent">0</span>
-      </label>
-      <label class="flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-lg
-                     bg-card2 border border-border/50 hover:border-orange-400/40 transition-colors"
-             title="Show only Chartink signals that match BOTH horizontal support AND swing-pullback. These are the highest-conviction setups — major structural level being retested via a fresh swing low. Tighter stop, faster target.">
-        <input type="checkbox" id="chartinkBothFilterToggle" onchange="_ckRenderStore()"
-               class="accent-orange-400 w-3.5 h-3.5">
-        <span class="text-slate-300">🔥 Show only BOTH (NS + Swing)</span>
-        <span id="chartinkBothCount" class="ml-1 px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-400">0</span>
-      </label>
-      <label class="flex items-center gap-2 cursor-pointer select-none px-3 py-1.5 rounded-lg
-                     bg-card2 border border-border/50 hover:border-accent2/40 transition-colors"
-             title="Show only Chartink signals with a swing-pullback setup (regardless of horizontal support). Useful for finding fresh bounce entries.">
-        <input type="checkbox" id="chartinkSwingFilterToggle" onchange="_ckRenderStore()"
-               class="accent-accent2 w-3.5 h-3.5">
-        <span class="text-slate-300">🎯 Show only Swing-Pullback</span>
-        <span id="chartinkSwingCount" class="ml-1 px-1.5 py-0.5 rounded bg-accent2/15 text-accent2">0</span>
-      </label>
-      <span class="text-slate-600 text-[11px]">
-        (multi-touch horizontal support · 3+ touches within ±0.7% · current price within ±2%)
-      </span>
+      <button onclick="ckExpandAll()" class="ck-toggle-pill" title="Expand all collapsed sections">
+        <svg class="w-3 h-3 inline -mt-0.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M5 15l7-7 7 7"/></svg>
+        Expand All
+      </button>
     </div>
 
-    <div class="mt-3 flex items-center gap-2 text-xs font-mono text-slate-600">
-      <span>Last scan:</span>
-      <span id="chartinkLastRun">never</span>
-      <span class="mx-1">&bull;</span>
-      <span>Next auto-scan:</span>
-      <span id="chartinkNextScan" class="text-accent2">5:00</span>
-      <span class="mx-1">&bull;</span>
-      <span>Last pull:</span>
-      <span id="chartinkSymbolCount">0</span>
-      <span class="text-slate-700">tickers</span>
-      <span id="chartinkSymbolList" class="text-slate-500 truncate"></span>
-    </div>
   </section>
 
-  <!-- ═══════════════ MOMENTUM SWEEP CONFIG (Chartink) ═══════════════ -->
-  <section class="glass-card rounded-2xl p-4 mb-4">
-    <!-- ═══════ Momentum Sweep (above 9EMA + HH intact) toggle + config ═══════ -->
-    <!-- Catches stocks ALREADY above 9EMA making higher-highs with intact
-         HH-LL structure (Close > prev day's Low). Different trade thesis
-         (3% momentum ride) than fresh-crossover breakouts. Shown in a
-         separate table on the Chartink tab. Persists to config.json via
-         PUT /api/config so it applies to the Chartink watcher automatically. -->
-    <div class="bg-card2/40 rounded-xl p-4 mb-5 border border-orange-500/20">
+  <!-- ═══════════════ SECTION TOGGLES ═══════════════ -->
+  <div class="flex items-center gap-1.5 flex-wrap px-1" id="ckSectionToggleRow">
+    <span class="text-[10px] text-slate-600 font-mono mr-1">SHOW:</span>
+    <button id="ckTogglePrime" class="ck-toggle-pill active" onclick="_ckToggleSection('prime')">Prime<span id="ckToggleCount_prime" class="pill-count"></span></button>
+    <button id="ckToggleOther" class="ck-toggle-pill" onclick="_ckToggleSection('other')">Technical<span id="ckToggleCount_other" class="pill-count"></span></button>
+    <button id="ckToggleMomentum" class="ck-toggle-pill active" onclick="_ckToggleSection('momentum')">Momentum<span id="ckToggleCount_momentum" class="pill-count"></span></button>
+    <button id="ckToggleNearSupport" class="ck-toggle-pill active" onclick="_ckToggleSection('nearSupport')">Near Support<span id="ckToggleCount_nearSupport" class="pill-count"></span></button>
+    <button id="ckToggleBoth" class="ck-toggle-pill active" onclick="_ckToggleSection('both')">Both Signals<span id="ckToggleCount_both" class="pill-count"></span></button>
+    <button id="ckToggleFailed" class="ck-toggle-pill" onclick="_ckToggleSection('failed')">Filtered/Failed<span id="ckToggleCount_failed" class="pill-count"></span></button>
+  </div>
+
+  <!-- ═══════════════ MOMENTUM SWEEP CONFIG (collapsible, compact) ═══════════════ -->
+  <section class="glass-card rounded-xl overflow-hidden" id="chartinkMsConfigSection">
+    <div class="px-4 py-2.5 flex items-center gap-3 cursor-pointer select-none" onclick="_ckToggleSectionBody(null,'ckMsConfigBody','ckMsConfigChevron')">
+      <svg class="ck-section-chevron rotated w-3 h-3 text-orange-400" id="ckMsConfigChevron" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
+      <span class="text-xs">🚀</span>
+      <label class="font-ui text-[11px] font-600 text-slate-400 uppercase tracking-wider">Momentum Sweep Config</label>
+      <div class="flex items-center gap-2 ml-2" onclick="event.stopPropagation()">
+        <div class="relative">
+          <input type="checkbox" id="momentumSweepToggle" class="sr-only peer" onchange="onMomentumSweepConfigChange()">
+          <div class="w-8 h-4 bg-card2 border border-border/50 rounded-full peer peer-checked:bg-orange-500/20 peer-checked:border-orange-400/40 transition-all"></div>
+          <div class="absolute top-0.5 left-0.5 w-3 h-3 bg-slate-500 rounded-full transition-all peer-checked:translate-x-4 peer-checked:bg-orange-400"></div>
+        </div>
+        <span id="momentumSweepBadge" class="font-mono text-[10px] px-1.5 py-0.5 rounded-full bg-slate-800 text-slate-500 border border-border/50">…</span>
+      </div>
+      <span id="momentumSweepStatus" class="font-mono text-[10px] text-slate-500"></span>
+    </div>
+    <div id="ckMsConfigBody" class="ck-ms-config-body collapsed px-4 pb-3">
       <div class="flex items-center gap-4 flex-wrap">
-        <div class="flex items-center gap-2 shrink-0">
-          <svg class="w-4 h-4 text-orange-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/>
-          </svg>
-          <label class="font-ui text-xs font-600 text-slate-300 uppercase tracking-wider"
-                 title="Stocks ALREADY above 9EMA making higher-highs with intact HH-LL structure. Different trade thesis (3% momentum ride) than fresh-crossover breakouts.">
-            Momentum Sweep (Above 9EMA + HH)
-          </label>
-        </div>
-        <div class="flex items-center gap-2">
-          <label class="flex items-center gap-2 cursor-pointer select-none"
-                 title="When ON: stocks above 9EMA making higher-highs with intact HH-LL structure are shown in a separate Momentum Sweep table. When OFF: momentum-sweep detection is disabled.">
-            <div class="relative">
-              <input type="checkbox" id="momentumSweepToggle" class="sr-only peer"
-                     onchange="onMomentumSweepConfigChange()">
-              <div class="w-10 h-5 bg-card2 border border-border/50 rounded-full peer
-                          peer-checked:bg-orange-500/20 peer-checked:border-orange-400/40 transition-all"></div>
-              <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-slate-500 rounded-full transition-all
-                          peer-checked:translate-x-5 peer-checked:bg-orange-400"></div>
-            </div>
-            <span class="font-ui text-xs text-slate-300 whitespace-nowrap">
-              Detection
-              <span id="momentumSweepBadge"
-                    class="ml-1 font-mono text-[10px] px-1.5 py-0.5 rounded-full
-                           bg-slate-800 text-slate-500 border border-border/50">…</span>
-            </span>
-          </label>
-          <span id="momentumSweepStatus" class="font-mono text-xs text-slate-500"></span>
-        </div>
-        <div class="flex items-center gap-3 ml-2">
-          <label class="flex items-center gap-1.5 font-ui text-xs text-slate-400"
-                 title="Target % for the momentum-ride trade plan. Default 3%.">
-            Target
-            <input type="number" id="momentumSweepTargetPct" min="0.5" max="20" step="0.5" value="3.0"
+        <label class="flex items-center gap-1 font-ui text-[11px] text-slate-400">
+          Target %<input type="number" id="momentumSweepTargetPct" min="0.5" max="20" step="0.5" value="3.0"
                    onchange="onMomentumSweepConfigChange()"
-                   class="w-16 bg-card2 border border-border/50 rounded-md px-2 py-1 font-mono text-xs text-slate-200
-                          focus:outline-none focus:border-orange-400/50">
-            <span class="text-slate-500 text-[10px]">%</span>
-          </label>
-          <label class="flex items-center gap-1.5 font-ui text-xs text-slate-400"
-                 title="Min EMA9 distance %. Filters out stocks flat-lining on the 9EMA (weak momentum). Default 0.5%.">
-            Min Dist
-            <input type="number" id="momentumSweepMinDist" min="0" max="5" step="0.1" value="0.5"
+                   class="w-14 bg-card2 border border-border/50 rounded px-1.5 py-0.5 font-mono text-xs text-slate-200 focus:outline-none focus:border-orange-400/50">
+        </label>
+        <label class="flex items-center gap-1 font-ui text-[11px] text-slate-400">
+          Min Dist %<input type="number" id="momentumSweepMinDist" min="0" max="5" step="0.1" value="0.5"
                    onchange="onMomentumSweepConfigChange()"
-                   class="w-14 bg-card2 border border-border/50 rounded-md px-2 py-1 font-mono text-xs text-slate-200
-                          focus:outline-none focus:border-orange-400/50">
-            <span class="text-slate-500 text-[10px]">%</span>
-          </label>
-          <label class="flex items-center gap-1.5 font-ui text-xs text-slate-400"
-                 title="Max EMA9 distance %. Filters out stocks too far extended above 9EMA (chase risk). Default 8%.">
-            Max Dist
-            <input type="number" id="momentumSweepMaxDist" min="1" max="30" step="0.5" value="8.0"
+                   class="w-14 bg-card2 border border-border/50 rounded px-1.5 py-0.5 font-mono text-xs text-slate-200 focus:outline-none focus:border-orange-400/50">
+        </label>
+        <label class="flex items-center gap-1 font-ui text-[11px] text-slate-400">
+          Max Dist %<input type="number" id="momentumSweepMaxDist" min="1" max="30" step="0.5" value="8.0"
                    onchange="onMomentumSweepConfigChange()"
-                   class="w-14 bg-card2 border border-border/50 rounded-md px-2 py-1 font-mono text-xs text-slate-200
-                          focus:outline-none focus:border-orange-400/50">
-            <span class="text-slate-500 text-[10px]">%</span>
-          </label>
-        </div>
-        <div class="flex-1 min-w-[200px] text-xs font-mono text-slate-500 leading-relaxed">
-          <span class="text-slate-400">How it works:</span>
-          Detects stocks with <span class="text-orange-400">Close &gt; 9EMA</span>,
-          <span class="text-orange-400">Close &gt; prev day's Low</span> (HH-LL intact), and
-          <span class="text-orange-400">≥2 of last 3 highs rising</span>. Target = price × (1 + Target%).
-          Persists to config &amp; applies to Chartink Live Feed automatically.
-        </div>
+                   class="w-14 bg-card2 border border-border/50 rounded px-1.5 py-0.5 font-mono text-xs text-slate-200 focus:outline-none focus:border-orange-400/50">
+        </label>
       </div>
     </div>
-
   </section>
 
-  <!-- ═══════════════ SUMMARY STATS ═══════════════ -->
-  <section id="chartinkSummarySection" class="hidden">
-    <div class="grid grid-cols-2 md:grid-cols-7 gap-4">
-      <div class="glass-card rounded-xl p-4 text-center" style="background:linear-gradient(135deg,rgba(16,185,129,.12),rgba(16,185,129,.04));border:1px solid rgba(16,185,129,.35);box-shadow:0 0 18px rgba(16,185,129,.18);">
-        <p class="font-mono text-2xl font-700 text-emerald-400" id="chartinkStatFresh">0</p>
-        <p class="font-ui text-xs text-emerald-400/80 mt-1">★ FRESH CROSSOVERS<br><span class="text-[10px] text-slate-500">(Today/Yesterday)</span></p>
+  <!-- ═══════════════ SUMMARY STATS (compact single row) ═══════════════ -->
+  <section id="chartinkSummarySection" class="hidden"><div class="glass-card rounded-xl overflow-hidden">
+      <div class="px-3 py-2 flex items-center gap-2 cursor-pointer select-none ck-card-header" onclick="ckToggleCollapsible('summaryStats')">
+        <svg class="ck-collapse-chevron" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
+        <span class="text-xs">&#128202;</span>
+        <span class="font-ui text-xs font-600 text-slate-400 uppercase tracking-wider">Summary Stats</span>
       </div>
-      <div class="glass-card rounded-xl p-4 text-center">
-        <p class="font-mono text-2xl font-700 text-white" id="chartinkStatTotal">0</p>
-        <p class="font-ui text-xs text-slate-500 mt-1">Stored Signals</p>
+      <div class="ck-collapsible-body" id="ckBody_summaryStats">
+    <div class="grid grid-cols-7 gap-1">
+      <div class="ck-stat-compact glass-card rounded-lg" style="background:linear-gradient(135deg,rgba(16,185,129,.08),rgba(16,185,129,.02));border:1px solid rgba(16,185,129,.25);">
+        <p class="stat-val text-emerald-400" id="chartinkStatFresh">0</p>
+        <p class="stat-label">Fresh Cross</p>
       </div>
-      <div class="glass-card rounded-xl p-4 text-center border-accent/20">
-        <p class="font-mono text-2xl font-700 text-accent" id="chartinkStatPrime">0</p>
-        <p class="font-ui text-xs text-slate-500 mt-1">Prime Targets</p>
+      <div class="ck-stat-compact glass-card rounded-lg">
+        <p class="stat-val text-white" id="chartinkStatTotal">0</p>
+        <p class="stat-label">Stored</p>
       </div>
-      <div class="glass-card rounded-xl p-4 text-center border-warn/20">
-        <p class="font-mono text-2xl font-700 text-warn" id="chartinkStatOther">0</p>
-        <p class="font-ui text-xs text-slate-500 mt-1">Technical Only</p>
+      <div class="ck-stat-compact glass-card rounded-lg border-accent/15">
+        <p class="stat-val text-accent" id="chartinkStatPrime">0</p>
+        <p class="stat-label">Prime</p>
       </div>
-      <div class="glass-card rounded-xl p-4 text-center border-orange-500/20"
-           style="background:linear-gradient(135deg,rgba(249,115,22,.10),rgba(249,115,22,.03));border:1px solid rgba(249,115,22,.30);">
-        <p class="font-mono text-2xl font-700 text-orange-400" id="chartinkStatMomentum">0</p>
-        <p class="font-ui text-xs text-orange-400/80 mt-1">🚀 Momentum Sweep<br><span class="text-[10px] text-slate-500">(Above 9EMA + HH)</span></p>
+      <div class="ck-stat-compact glass-card rounded-lg border-warn/15">
+        <p class="stat-val text-warn" id="chartinkStatOther">0</p>
+        <p class="stat-label">Technical</p>
       </div>
-      <div class="glass-card rounded-xl p-4 text-center">
-        <p class="font-mono text-2xl font-700 text-slate-400" id="chartinkStatFiltered">0</p>
-        <p class="font-ui text-xs text-slate-500 mt-1">Last Scan Filtered</p>
+      <div class="ck-stat-compact glass-card rounded-lg" style="border:1px solid rgba(249,115,22,.2);">
+        <p class="stat-val text-orange-400" id="chartinkStatMomentum">0</p>
+        <p class="stat-label">Momentum</p>
       </div>
-      <div class="glass-card rounded-xl p-4 text-center">
-        <p class="font-mono text-2xl font-700 text-danger" id="chartinkStatFailed">0</p>
-        <p class="font-ui text-xs text-slate-500 mt-1">Last Scan Failed</p>
+      <div class="ck-stat-compact glass-card rounded-lg">
+        <p class="stat-val text-slate-400" id="chartinkStatFiltered">0</p>
+        <p class="stat-label">Filtered</p>
       </div>
+      <div class="ck-stat-compact glass-card rounded-lg">
+        <p class="stat-val text-danger" id="chartinkStatFailed">0</p>
+        <p class="stat-label">Failed</p>
+      </div>
+    </div>
+  </div></div>
+</section>
+
+
+  <!-- ═══════════════ TABLE A: PRIME TARGETS (Chartink) ═══════════════ -->
+  <section id="chartinkPrimeSection" class="hidden">
+    <div class="glass-card rounded-2xl overflow-hidden">
+      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap ck-card-header">
+        <svg class="ck-collapse-chevron" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg><span class="text-lg">🎯</span>
+        <h2 class="font-ui text-lg font-700 text-accent">PRIME TARGETS: UNDERVALUED + UPTREND</h2>
+        <span id="chartinkPrimeCount" class="font-mono text-xs section-count-badge bg-accent/10 text-accent px-2 py-0.5 rounded-full">0</span>
+        <div class="ml-auto flex items-center gap-2">
+          <span class="font-mono text-xs text-slate-500">Sort:</span>
+          <select id="chartinkPrimeSortSelect" onchange="sortChartinkTable('prime')"
+            class="bg-card2 border border-border/50 rounded-lg px-3 py-1 font-mono text-xs text-slate-300
+                   focus:outline-none focus:border-accent/50">
+            <option value="fresh_first">★ Fresh Crossovers First (Today/Yesterday)</option>
+            <option value="initial_ema9_asc">Cleanest Crossover ↑ (Smallest BO Gap)</option>
+            <option value="gap_desc">Gap to FV ↓ (Most Undervalued)</option>
+            <option value="gap_asc">Gap to FV ↑ (Least Undervalued)</option>
+            <option value="candles_asc">Freshness ↑ (Newest Signal)</option>
+            <option value="candles_desc">Freshness ↓ (Oldest Signal)</option>
+            <option value="price_desc">Price ↓</option>
+            <option value="price_asc">Price ↑</option>
+          </select>
+          <button onclick="exportChartinkCsv('prime')"
+            class="export-btn px-3 py-1 rounded-lg font-ui font-600 text-xs
+                   bg-accent/10 border border-accent/30 text-accent
+                   hover:bg-accent/20 hover:border-accent/50 transition-all duration-200
+                   flex items-center gap-1.5 whitespace-nowrap"
+            title="Export this table to CSV (Excel-compatible, with ₹ symbol support)">
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/>
+            </svg>
+            Export CSV
+          </button>
+        </div>
+      </div>
+      <div class="ck-collapsible-body" id="ckBody_prime"><div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-left text-xs font-ui font-600 text-slate-500 uppercase tracking-wider border-b border-border/30">
+              <th class="px-4 py-3">Ticker</th>
+              <th class="px-4 py-3">Price</th>
+              <th class="px-4 py-3" title="Target price for this signal. When Vol Target Mode = 'fixed', this is price × 1.03 (legacy 3%). When mode = 'atr', this is price × (1 + clamp(multiplier × ATR/price × 100, floor, cap)/100) — adapted to each stock's volatility.">Target ₹</th>
+              <th class="px-4 py-3">EMA 9</th>
+              <th class="px-4 py-3">BO EMA9 Gap%</th>
+              <th class="px-4 py-3">Curr EMA9 Gap%</th>
+              <th class="px-4 py-3">SMA 50</th>
+              <th class="px-4 py-3" title="ATR (Average True Range) as % of price at the breakout day. Higher = more volatile stock. Used to compute Target ₹ when Vol Target Mode = 'atr'.">ATR %</th>
+              <th class="px-4 py-3" title="Effective target % applied to this signal. 'Fixed' = 3% (legacy). 'ATR' = clamp(multiplier × ATR/price × 100, floor, cap) — varies per signal.">Eff Target %</th>
+              <th class="px-4 py-3">Fair Value</th>
+              <th class="px-4 py-3">Gap to FV</th>
+              <th class="px-4 py-3" title="Highest High in the Pullback Lookback window BEFORE the breakout day. The 'previous high' the stock is recovering from.">Prior High</th>
+              <th class="px-4 py-3" title="Pullback from Prior High: (prior_high - entry_price) / prior_high × 100. ≥ threshold % = pullback setup (green), 0..threshold = mild pullback (amber), ≤0 = extended above prior high (red).">Pullback %</th>
+              <th class="px-4 py-3">BO Date</th>
+              <th class="px-4 py-3">CF Date</th>
+              <th class="px-4 py-3">Ago</th>
+              <th class="px-4 py-3">Trend</th>
+              <th class="px-4 py-3" id="chartinkPrimeNSHeader" title="Multi-touch horizontal support detection. 🎯 = price within ±2% of a 3+ touch support level (120d/500d lookback).">🎯 Near Support</th>
+              <th class="px-4 py-3" id="chartinkPrimeSwingHeader" title="Swing-pullback detection. 🎯 = price is at the most recent UNBROKEN swing low (7-bar fractal, within 20 days, 0-3% above swing, higher-low confirmed). Tighter, fresher entry than horizontal support.">🎯 Swing</th>
+              <th class="px-4 py-3" title="Deepest unbroken swing low — STOP PLACEMENT level. Place stop-loss just below this. Column shows ₹ structural low + stop distance %.">🏛️ Structural Low</th>
+              <th class="px-4 py-3">Status</th>
+            </tr>
+          </thead>
+          <tbody id="chartinkPrimeTableBody"></tbody>
+        </table>
+      </div></div>
     </div>
   </section>
 
@@ -1229,16 +1479,33 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
   <section id="chartinkBothSection" class="hidden">
     <div class="glass-card rounded-2xl overflow-hidden"
          style="background:linear-gradient(135deg,rgba(249,115,22,.10),rgba(245,158,11,.04));border:1px solid rgba(249,115,22,.45);box-shadow:0 0 26px rgba(249,115,22,.18);">
-      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap">
-        <span class="text-lg">🔥</span>
+      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap ck-card-header">
+        <svg class="ck-collapse-chevron" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg><span class="text-lg">🔥</span>
         <h2 class="font-ui text-lg font-700 text-orange-400">HIGHEST CONVICTION: BOTH SIGNALS</h2>
-        <span id="chartinkBothSectionCount" class="font-mono text-xs bg-orange-500/15 text-orange-400 px-2 py-0.5 rounded-full">0</span>
-        <span class="font-mono text-xs text-slate-500 ml-1">
-          Chartink signals matching BOTH horizontal support AND swing-pullback &bull; tightest stop, fastest target
+        <span id="chartinkBothSectionCount" class="font-mono text-xs section-count-badge bg-orange-500/15 text-orange-400 px-2 py-0.5 rounded-full">0</span>
+        <span class="font-mono text-xs text-slate-500 ml-1 section-desc">
+          Chartink signals matching BOTH horizontal support AND swing-pullback &bull; filtered by structural low stop distance
         </span>
         <div class="ml-auto flex items-center gap-2">
+          <span class="font-mono text-xs text-slate-500">Max Stop Dist:</span>
+          <select id="ckBothMaxStopDist" onchange="_ckRenderStore()" class="bg-card2 border border-border/50 rounded-lg px-2 py-1 font-mono text-xs text-slate-300 focus:outline-none focus:border-orange-400/50">
+            <option value="0" selected>All</option>
+            <optgroup label="Above Low (Tight Stop)">
+              <option value="1.0">1%</option>
+              <option value="2.0">2%</option>
+              <option value="3.0">3%</option>
+              <option value="5.0">5%</option>
+              <option value="10.0">10%</option>
+            </optgroup>
+            <optgroup label="Below Low (Breakdown)">
+              <option value="-1.0">-1%</option>
+              <option value="-2.0">-2%</option>
+              <option value="-3.0">-3%</option>
+              <option value="-5.0">-5%</option>
+            </optgroup>
+          </select>
           <button onclick="exportChartinkBothCsv()"
-            class="px-3 py-1 rounded-lg font-ui font-600 text-xs
+            class="export-btn px-3 py-1 rounded-lg font-ui font-600 text-xs
                    bg-orange-500/10 border border-orange-400/30 text-orange-400
                    hover:bg-orange-500/20 hover:border-orange-400/50 transition-all duration-200
                    flex items-center gap-1.5 whitespace-nowrap"
@@ -1250,7 +1517,7 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
           </button>
         </div>
       </div>
-      <div class="overflow-x-auto">
+      <div class="ck-collapsible-body" id="ckBody_both"><div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead>
             <tr class="text-left text-xs font-ui font-600 text-slate-500 uppercase tracking-wider border-b border-border/30">
@@ -1275,7 +1542,7 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
             </td></tr>
           </tbody>
         </table>
-      </div>
+      </div></div>
     </div>
   </section>
 
@@ -1283,16 +1550,16 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
   <section id="chartinkNearSupportSection" class="hidden">
     <div class="glass-card rounded-2xl overflow-hidden"
          style="background:linear-gradient(135deg,rgba(0,229,160,.06),rgba(0,184,212,.03));border:1px solid rgba(0,229,160,.35);box-shadow:0 0 22px rgba(0,229,160,.12);">
-      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap">
-        <span class="text-lg">🎯</span>
+      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap ck-card-header">
+        <svg class="ck-collapse-chevron" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg><span class="text-lg">🎯</span>
         <h2 class="font-ui text-lg font-700 text-accent">NEAR SUPPORT IN CHARTINK FEED</h2>
-        <span id="chartinkNearSupportCount" class="font-mono text-xs bg-accent/10 text-accent px-2 py-0.5 rounded-full">0</span>
-        <span class="font-mono text-xs text-slate-500 ml-1">
+        <span id="chartinkNearSupportCount" class="font-mono text-xs section-count-badge bg-accent/10 text-accent px-2 py-0.5 rounded-full">0</span>
+        <span class="font-mono text-xs text-slate-500 ml-1 section-desc">
           Chartink signals currently within ±2% of a 3+ touch horizontal support · auto-enriched every scan
         </span>
         <div class="ml-auto flex items-center gap-2">
           <button onclick="exportChartinkNearSupportCsv()"
-            class="px-3 py-1 rounded-lg font-ui font-600 text-xs
+            class="export-btn px-3 py-1 rounded-lg font-ui font-600 text-xs
                    bg-accent/10 border border-accent/30 text-accent
                    hover:bg-accent/20 hover:border-accent/50 transition-all duration-200
                    flex items-center gap-1.5 whitespace-nowrap"
@@ -1304,7 +1571,7 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
           </button>
         </div>
       </div>
-      <div class="overflow-x-auto">
+      <div class="ck-collapsible-body" id="ckBody_nearSupport"><div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead>
             <tr class="text-left text-xs font-ui font-600 text-slate-500 uppercase tracking-wider border-b border-border/30">
@@ -1326,83 +1593,18 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
             </td></tr>
           </tbody>
         </table>
-      </div>
+      </div></div>
     </div>
   </section>
 
-  <!-- ═══════════════ TABLE A: PRIME TARGETS (Chartink) ═══════════════ -->
-  <section id="chartinkPrimeSection" class="hidden">
-    <div class="glass-card rounded-2xl overflow-hidden">
-      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap">
-        <span class="text-lg">🎯</span>
-        <h2 class="font-ui text-lg font-700 text-accent">PRIME TARGETS: UNDERVALUED + UPTREND</h2>
-        <span id="chartinkPrimeCount" class="font-mono text-xs bg-accent/10 text-accent px-2 py-0.5 rounded-full">0</span>
-        <div class="ml-auto flex items-center gap-2">
-          <span class="font-mono text-xs text-slate-500">Sort:</span>
-          <select id="chartinkPrimeSortSelect" onchange="sortChartinkTable('prime')"
-            class="bg-card2 border border-border/50 rounded-lg px-3 py-1 font-mono text-xs text-slate-300
-                   focus:outline-none focus:border-accent/50">
-            <option value="fresh_first">★ Fresh Crossovers First (Today/Yesterday)</option>
-            <option value="initial_ema9_asc">Cleanest Crossover ↑ (Smallest BO Gap)</option>
-            <option value="gap_desc">Gap to FV ↓ (Most Undervalued)</option>
-            <option value="gap_asc">Gap to FV ↑ (Least Undervalued)</option>
-            <option value="candles_asc">Freshness ↑ (Newest Signal)</option>
-            <option value="candles_desc">Freshness ↓ (Oldest Signal)</option>
-            <option value="price_desc">Price ↓</option>
-            <option value="price_asc">Price ↑</option>
-          </select>
-          <button onclick="exportChartinkCsv('prime')"
-            class="px-3 py-1 rounded-lg font-ui font-600 text-xs
-                   bg-accent/10 border border-accent/30 text-accent
-                   hover:bg-accent/20 hover:border-accent/50 transition-all duration-200
-                   flex items-center gap-1.5 whitespace-nowrap"
-            title="Export this table to CSV (Excel-compatible, with ₹ symbol support)">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/>
-            </svg>
-            Export CSV
-          </button>
-        </div>
-      </div>
-      <div class="overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="text-left text-xs font-ui font-600 text-slate-500 uppercase tracking-wider border-b border-border/30">
-              <th class="px-4 py-3">Ticker</th>
-              <th class="px-4 py-3">Price</th>
-              <th class="px-4 py-3" title="Target price for this signal. When Vol Target Mode = 'fixed', this is price × 1.03 (legacy 3%). When mode = 'atr', this is price × (1 + clamp(multiplier × ATR/price × 100, floor, cap)/100) — adapted to each stock's volatility.">Target ₹</th>
-              <th class="px-4 py-3">EMA 9</th>
-              <th class="px-4 py-3">BO EMA9 Gap%</th>
-              <th class="px-4 py-3">Curr EMA9 Gap%</th>
-              <th class="px-4 py-3">SMA 50</th>
-              <th class="px-4 py-3" title="ATR (Average True Range) as % of price at the breakout day. Higher = more volatile stock. Used to compute Target ₹ when Vol Target Mode = 'atr'.">ATR %</th>
-              <th class="px-4 py-3" title="Effective target % applied to this signal. 'Fixed' = 3% (legacy). 'ATR' = clamp(multiplier × ATR/price × 100, floor, cap) — varies per signal.">Eff Target %</th>
-              <th class="px-4 py-3">Fair Value</th>
-              <th class="px-4 py-3">Gap to FV</th>
-              <th class="px-4 py-3" title="Highest High in the Pullback Lookback window BEFORE the breakout day. The 'previous high' the stock is recovering from.">Prior High</th>
-              <th class="px-4 py-3" title="Pullback from Prior High: (prior_high - entry_price) / prior_high × 100. ≥ threshold % = pullback setup (green), 0..threshold = mild pullback (amber), ≤0 = extended above prior high (red).">Pullback %</th>
-              <th class="px-4 py-3">BO Date</th>
-              <th class="px-4 py-3">CF Date</th>
-              <th class="px-4 py-3">Ago</th>
-              <th class="px-4 py-3">Trend</th>
-              <th class="px-4 py-3" id="chartinkPrimeNSHeader" title="Multi-touch horizontal support detection. 🎯 = price within ±2% of a 3+ touch support level (120d/500d lookback).">🎯 Near Support</th>
-              <th class="px-4 py-3" id="chartinkPrimeSwingHeader" title="Swing-pullback detection. 🎯 = price is at the most recent UNBROKEN swing low (7-bar fractal, within 20 days, 0-3% above swing, higher-low confirmed). Tighter, fresher entry than horizontal support.">🎯 Swing</th>
-              <th class="px-4 py-3">Status</th>
-            </tr>
-          </thead>
-          <tbody id="chartinkPrimeTableBody"></tbody>
-        </table>
-      </div>
-    </div>
-  </section>
 
   <!-- ═══════════════ TABLE B: OTHER SIGNALS (Chartink) ═══════════════ -->
   <section id="chartinkOtherSection" class="hidden">
     <div class="glass-card rounded-2xl overflow-hidden">
-      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap">
-        <span class="text-lg">⚖️</span>
+      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap ck-card-header">
+        <svg class="ck-collapse-chevron" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg><span class="text-lg">⚖️</span>
         <h2 class="font-ui text-lg font-700 text-warn">TECHNICAL BREAKOUTS (OVERVALUED)</h2>
-        <span id="chartinkOtherCount" class="font-mono text-xs bg-warn/10 text-warn px-2 py-0.5 rounded-full">0</span>
+        <span id="chartinkOtherCount" class="font-mono text-xs section-count-badge bg-warn/10 text-warn px-2 py-0.5 rounded-full">0</span>
         <div class="ml-auto flex items-center gap-2">
           <span class="font-mono text-xs text-slate-500">Sort:</span>
           <select id="chartinkOtherSortSelect" onchange="sortChartinkTable('other')"
@@ -1418,7 +1620,7 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
             <option value="price_asc">Price ↑</option>
           </select>
           <button onclick="exportChartinkCsv('other')"
-            class="px-3 py-1 rounded-lg font-ui font-600 text-xs
+            class="export-btn px-3 py-1 rounded-lg font-ui font-600 text-xs
                    bg-warn/10 border border-warn/30 text-warn
                    hover:bg-warn/20 hover:border-warn/50 transition-all duration-200
                    flex items-center gap-1.5 whitespace-nowrap"
@@ -1430,7 +1632,7 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
           </button>
         </div>
       </div>
-      <div class="overflow-x-auto">
+      <div class="ck-collapsible-body" id="ckBody_other"><div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead>
             <tr class="text-left text-xs font-ui font-600 text-slate-500 uppercase tracking-wider border-b border-border/30">
@@ -1453,12 +1655,13 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
               <th class="px-4 py-3">Trend</th>
               <th class="px-4 py-3" id="chartinkOtherNSHeader" title="Multi-touch horizontal support detection. 🎯 = price within ±2% of a 3+ touch support level.">🎯 Near Support</th>
               <th class="px-4 py-3" id="chartinkOtherSwingHeader" title="Swing-pullback detection. 🎯 = price is at the most recent UNBROKEN swing low. Tighter, fresher entry than horizontal support.">🎯 Swing</th>
+              <th class="px-4 py-3" title="Deepest unbroken swing low — STOP PLACEMENT level.">🏛️ Structural Low</th>
               <th class="px-4 py-3">Status</th>
             </tr>
           </thead>
           <tbody id="chartinkOtherTableBody"></tbody>
         </table>
-      </div>
+      </div></div>
     </div>
   </section>
 
@@ -1466,11 +1669,11 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
   <section id="chartinkMomentumSection">
     <div class="glass-card rounded-2xl overflow-hidden"
          style="background:linear-gradient(135deg,rgba(249,115,22,.10),rgba(249,115,22,.03));border:1px solid rgba(249,115,22,.35);box-shadow:0 0 22px rgba(249,115,22,.15);">
-      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap">
-        <span class="text-lg">🚀</span>
+      <div class="px-6 py-4 border-b border-border/50 flex items-center gap-3 flex-wrap ck-card-header">
+        <svg class="ck-collapse-chevron" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg><span class="text-lg">🚀</span>
         <h2 class="font-ui text-lg font-700 text-orange-400">MOMENTUM SWEEP: ABOVE 9EMA + HH INTACT</h2>
-        <span id="chartinkMomentumCount" class="font-mono text-xs bg-orange-500/15 text-orange-400 px-2 py-0.5 rounded-full">0</span>
-        <span class="font-mono text-xs text-slate-500 ml-1">
+        <span id="chartinkMomentumCount" class="font-mono text-xs section-count-badge bg-orange-500/15 text-orange-400 px-2 py-0.5 rounded-full">0</span>
+        <span class="font-mono text-xs text-slate-500 ml-1 section-desc">
           Above rising 9EMA • Green candles • Strong closes • HH-LL intact • 3% momentum ride
         </span>
         <div class="ml-auto flex items-center gap-2">
@@ -1491,7 +1694,7 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
             <option value="price_asc">Price ↑</option>
           </select>
           <button onclick="exportChartinkMomentumCsv()"
-            class="px-3 py-1 rounded-lg font-ui font-600 text-xs
+            class="export-btn px-3 py-1 rounded-lg font-ui font-600 text-xs
                    bg-orange-500/10 border border-orange-400/30 text-orange-400
                    hover:bg-orange-500/20 hover:border-orange-400/50 transition-all duration-200
                    flex items-center gap-1.5 whitespace-nowrap"
@@ -1503,7 +1706,7 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
           </button>
         </div>
       </div>
-      <div class="overflow-x-auto">
+      <div class="ck-collapsible-body" id="ckBody_momentum"><div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead>
             <tr class="text-left text-xs font-ui font-600 text-slate-500 uppercase tracking-wider border-b border-border/30">
@@ -1532,7 +1735,7 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
             </td></tr>
           </tbody>
         </table>
-      </div>
+      </div></div>
     </div>
   </section>
 
@@ -1566,6 +1769,9 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
       </div>
     </div>
   </section>
+
+
+
 
   <!-- ═══════════════ EMPTY STATE ═══════════════ -->
   <section id="chartinkEmptySection" class="glass-card rounded-2xl p-10 text-center">
@@ -3530,6 +3736,7 @@ function _renderChartinkFeedToggleUI(enabled) {
  */
 function _applyChartinkFeedState(enabled) {
   const scanNowBtn = document.getElementById('chartinkScanNowBtn');
+  const scanAllBtn = document.getElementById('chartinkScanAllBtn');
   if (enabled) {
     // (Re)start polling if it was previously stopped by this toggle
     // startChartinkPolling() is idempotent — it checks _chartinkPollStarted
@@ -3541,6 +3748,11 @@ function _applyChartinkFeedState(enabled) {
       scanNowBtn.classList.remove('opacity-40', 'cursor-not-allowed');
       scanNowBtn.title = '';
     }
+    if (scanAllBtn) {
+      scanAllBtn.disabled = false;
+      scanAllBtn.classList.remove('opacity-40', 'cursor-not-allowed');
+      scanAllBtn.title = 'Scan ALL NSE F&O tickers (full universe — no Chartink filter).';
+    }
   } else {
     // Stop the polling timer + countdown
     if (_chartinkPollTimer) { clearInterval(_chartinkPollTimer); _chartinkPollTimer = null; }
@@ -3551,6 +3763,12 @@ function _applyChartinkFeedState(enabled) {
       scanNowBtn.disabled = true;
       scanNowBtn.classList.add('opacity-40', 'cursor-not-allowed');
       scanNowBtn.title = 'Chartink Live Feed is disabled. Toggle it back ON via the header switch.';
+    }
+    // Disable Scan All 307
+    if (scanAllBtn) {
+      scanAllBtn.disabled = true;
+      scanAllBtn.classList.add('opacity-40', 'cursor-not-allowed');
+      scanAllBtn.title = 'Chartink Live Feed is disabled. Toggle it back ON via the header switch.';
     }
     // Update the countdown display
     const nextScanEl = document.getElementById('chartinkNextScan');
@@ -5301,6 +5519,36 @@ function buildRow(s, isPrime) {
 
   const nsCell = _buildNsCell(s);
 
+  // ─── Structural Low cell (STOP PLACEMENT — for ALL rows, not just swing) ──
+  // Shows the deepest unbroken swing low + proximity % even when there's no
+  // active swing-pullback setup. This is the real stop-loss placement level.
+  const _buildStructuralCell = (sig) => {
+    const sLow  = sig.structural_swing_low_price;
+    const sProx = sig.structural_swing_proximity_pct;
+    const sDays = sig.structural_swing_days_ago;
+    const sDate = (sig.structural_swing_low_date || '').slice(0, 10);
+    const sTouches = sig.structural_touches;
+    if (sLow == null || sProx == null) {
+      return '<td class="px-4 py-3 font-mono text-slate-700 text-xs" title="No structural low data">—</td>';
+    }
+    const proxSign = sProx >= 0 ? '+' : '';
+    const proxCls  = sProx >= 0
+      ? (sProx <= 2.0 ? 'text-emerald-400 font-700' : sProx <= 5.0 ? 'text-orange-400 font-600' : 'text-warn')
+      : (Math.abs(sProx) <= 2.0 ? 'text-red-400 font-700' : 'text-red-500');
+    const belowBadge = sProx < 0
+      ? '<span class="text-[9px] text-red-400/80 ml-0.5">BELOW</span>'
+      : '';
+    const touchBadge = sTouches != null && sTouches > 1
+      ? `<span class="text-[9px] text-violet-300/70 ml-0.5">×${sTouches} touches</span>`
+      : '';
+    return `<td class="px-4 py-3 font-mono text-xs" title="Structural low (most-touched swing zone) — STOP PLACEMENT. Tested ${sTouches || 1} times. Formed ${sDate} (${sDays}d ago). Stop distance: ${proxSign}${sProx.toFixed(2)}%. Place stop just below ₹${sLow}.">`
+      + `<div><span class="text-base mr-1">🏛️</span>`
+      + `<span class="text-slate-300">₹${sLow}</span></div>`
+      + `<div class="mt-0.5 ${proxCls}">${proxSign}${sProx.toFixed(2)}% <span class="text-slate-600 text-[9px]">${sDays}d</span>${touchBadge}${belowBadge}</div>`
+      + `</td>`;
+  };
+  const structuralCell = _buildStructuralCell(s);
+
   return `
     <tr class="signal-row border-b border-border/20 ${rowTintCls}" data-ticker="${s.ticker}" onclick='openChartForTicker("${s.ticker}")'>
       <td class="px-4 py-3 font-ui font-700 text-white">${s.ticker}${freshBadge}${tradeBtnHtml}</td>
@@ -5322,6 +5570,7 @@ function buildRow(s, isPrime) {
       <td class="px-4 py-3"><span class="font-mono text-xs px-2 py-0.5 rounded ${trendClass}">${trendRegime}</span></td>
       ${nsCell}
       ${swingCell}
+      ${structuralCell}
       <td class="px-4 py-3">${statusBadge}</td>
     </tr>`;
 }
@@ -6312,6 +6561,10 @@ function _ckPopulateBothSection(bothEntries) {
   const countEl = document.getElementById('chartinkBothSectionCount');
   if (!tbody || !section) return;
 
+  // Read Max Stop Dist filter from dropdown
+  const maxStopDist = parseFloat(document.getElementById('ckBothMaxStopDist')?.value || 0);
+  const isFilterActive = maxStopDist !== 0;
+
   if (!bothEntries || bothEntries.length === 0) {
     section.classList.add('hidden');
     tbody.innerHTML = `<tr><td colspan="10" class="text-center text-slate-500 py-8">
@@ -6321,11 +6574,41 @@ function _ckPopulateBothSection(bothEntries) {
     if (countEl) countEl.textContent = '0';
     return;
   }
-  section.classList.remove('hidden');
-  if (countEl) countEl.textContent = bothEntries.length;
 
-  // Sort: highest combined score (NS score + swing score) first
-  const sorted = bothEntries.slice().sort((a, b) => {
+  // Filter by structural_swing_proximity_pct (distance from deepest unbroken swing low)
+  // Entries WITHOUT structural data always pass through (shown with "—" in table)
+  let filtered = bothEntries;
+  if (isFilterActive) {
+    const isBelowMode = maxStopDist < 0;
+    filtered = bothEntries.filter(s => {
+      const prox = s.structural_swing_proximity_pct;
+      if (prox == null) return true; // no structural data → always pass
+      if (isBelowMode) {
+        return prox < 0 && prox >= maxStopDist;
+      } else {
+        return prox >= 0 && prox <= maxStopDist;
+      }
+    });
+  }
+
+  if (filtered.length === 0) {
+    section.classList.remove('hidden'); // still show section with empty message
+    const modeLabel = maxStopDist < 0 ? 'below' : 'within';
+    tbody.innerHTML = `<tr><td colspan="10" class="text-center text-slate-500 py-8">
+      No BOTH signals ${modeLabel} ${Math.abs(maxStopDist)}% of structural low.<br><span class="text-xs text-slate-600">Set filter to "All" to see all BOTH signals.</span>
+    </td></tr>`;
+    if (countEl) countEl.textContent = '0';
+    return;
+  }
+
+  section.classList.remove('hidden');
+  if (countEl) countEl.textContent = filtered.length;
+
+  // Sort: closest to structural low first (tightest stop), then by combined score
+  const sorted = filtered.slice().sort((a, b) => {
+    const pa = Math.abs(a.structural_swing_proximity_pct ?? 999);
+    const pb = Math.abs(b.structural_swing_proximity_pct ?? 999);
+    if (pa !== pb) return pa - pb;
     const sa = (a.near_support_score ?? 0) + (a.swing_pullback_score ?? 0);
     const sb = (b.near_support_score ?? 0) + (b.swing_pullback_score ?? 0);
     return sb - sa;
@@ -6541,6 +6824,11 @@ function exportChartinkNearSupportCsv() {
   URL.revokeObjectURL(url);
 }
 
+
+// ═══════════════════════════════════════════════════════════
+//  Near Structural Low — populate from store
+
+
 function _ckRenderStore() {
   const store = _ckLoadStore();
   const meta  = _ckLoadMeta();
@@ -6619,6 +6907,7 @@ function _ckRenderStore() {
   const symPulled = meta.symbols_pulled || [];
   document.getElementById('chartinkSymbolCount').textContent = symPulled.length;
   document.getElementById('chartinkSymbolList').textContent  = symPulled.length ? `(${symPulled.join(', ')})` : '';
+  document.getElementById('chartinkSymbolList').title = symPulled.length ? symPulled.join(', ') : '';
 
   // Update store count badge
   const totalStored = allEntries.length;
@@ -6877,6 +7166,97 @@ async function runChartinkScanNow() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════
+//  SCAN ALL 307 NSE — Full Universe Screener
+// ══════════════════════════════════════════════════════════════════
+//  Calls POST /api/ema9/screen-all-nse which loads ALL tickers from
+//  the local CSV (tickers.csv / tickers_all.csv) and runs the FULL
+//  9EMA pipeline — no Chartink clause pre-filter.
+//
+//  This catches:
+//    • Fresh 9EMA crossovers on ANY ticker (not just Chartink-filtered)
+//    • Prime targets (undervalued per Fair Value)
+//    • Momentum sweep candidates (already above 9EMA + HH intact)
+//    • Near-support and swing-pullback enrichment
+//
+//  Results are merged into the same Chartink persistent store via
+//  _ckMergeResults() so they appear in the same Prime / Other /
+//  Momentum tables with NEW badges.
+// ══════════════════════════════════════════════════════════════════
+
+async function runChartinkScanAll() {
+  const btn     = document.getElementById('chartinkScanAllBtn');
+  const txt     = document.getElementById('chartinkScanAllText');
+  const spinner = document.getElementById('chartinkScanAllSpinner');
+
+  if (!btn || !txt || !spinner) return;
+
+  btn.disabled = true;
+  txt.textContent = 'Scanning All...';
+  spinner.classList.remove('hidden');
+  setChartinkStatus(
+    'Scanning ALL NSE F&O tickers through full 9EMA pipeline... ' +
+    '(first run: ~5-10 min for yfinance data, cached after that: <10s)',
+    'info'
+  );
+
+  // Disable the Scan Now button during full scan to prevent conflicts
+  const scanNowBtn = document.getElementById('chartinkScanNowBtn');
+  if (scanNowBtn) scanNowBtn.disabled = true;
+
+  const startTime = Date.now();
+
+  try {
+    const resp = await fetch('/api/ema9/screen-all-nse', { method: 'POST' });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || `HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+    // Update the "Last pull" ticker count in the control bar
+    const totalScanned = data.total_tickers_scanned || 0;
+    const symCountEl = document.getElementById('chartinkSymbolCount');
+    if (symCountEl) symCountEl.textContent = totalScanned;
+
+    const symListEl = document.getElementById('chartinkSymbolList');
+    if (symListEl) symListEl.textContent = `(${data.scan_source || 'local CSV'})`;
+
+    // Ingest results into the Chartink persistent store
+    // Wrap in { result: ... } so _ckIngestAndRender can process it
+    // (it expects the chartink-screener response format with data.result)
+    const wrappedData = {
+      result: data,
+      last_run_at: data.last_run_at || new Date().toISOString(),
+      symbols_pulled: [],  // full scan, not from chartink clause
+      scan_mode: 'all_nse',
+    };
+    _ckIngestAndRender(wrappedData);
+
+    const store = _ckLoadStore();
+    const primeCount = Object.values(store).filter(s => s._isPrime).length;
+    const otherCount = Object.values(store).filter(s => !s._isPrime && s.status === 'SIGNAL').length;
+    const msCount    = data.momentum_sweep_count || 0;
+
+    setChartinkStatus(
+      `Full Universe Scan complete (${elapsed}s) • ` +
+      `${totalScanned} tickers scanned → ` +
+      `${data.prime_count || 0} prime, ${data.other_count || 0} other, ` +
+      `${msCount} momentum sweep • ` +
+      `${Object.keys(store).length} total signals stored`,
+      'success'
+    );
+  } catch (err) {
+    setChartinkStatus('Full Universe Scan error: ' + err.message, 'danger');
+  } finally {
+    btn.disabled = false;
+    txt.textContent = 'Scan All 307';
+    spinner.classList.add('hidden');
+    if (scanNowBtn) scanNowBtn.disabled = false;
+  }
+}
+
 // ─── Active clause selector (drives Scan Now + the background scheduler) ──
 let _ckAvailableClauses     = {};   // name -> scan_clause text (from chartink_router registry)
 let _ckActiveClauseNames    = [];   // currently active/persisted selection
@@ -6946,6 +7326,171 @@ async function ckOnClauseSelectionChange() {
   }
 }
 
+
+// ═══════════════════════════════════════════════════════════
+//  COLLAPSIBLE SECTIONS + FONT-SIZE CONTROLLER
+// ═══════════════════════════════════════════════════════════
+const CK_COLLAPSE_KEY = 'ck_section_collapsed';
+
+function _ckLoadCollapseState() {
+  try { return JSON.parse(localStorage.getItem(CK_COLLAPSE_KEY)) || {}; } catch { return {}; }
+}
+function _ckSaveCollapseState(s) {
+  try { localStorage.setItem(CK_COLLAPSE_KEY, JSON.stringify(s)); } catch {}
+}
+
+function ckToggleCollapsible(key) {
+  var state = _ckLoadCollapseState();
+  state[key] = !state[key];
+  _ckSaveCollapseState(state);
+  _ckApplyCollapsibleState();
+}
+
+function _ckApplyCollapsibleState() {
+  var state = _ckLoadCollapseState();
+  var keys = ['both', 'nearSupport', 'prime', 'other', 'momentum', 'summaryStats', 'failed'];
+  keys.forEach(function(key) {
+    var body = document.getElementById('ckBody_' + key);
+    if (!body) return;
+    var collapsed = state[key] === true;
+    body.classList.toggle('collapsed', collapsed);
+    var section = body.closest('section') || body.parentElement;
+    if (section) {
+      var chevron = section.querySelector('.ck-collapse-chevron');
+      if (chevron) chevron.classList.toggle('collapsed', collapsed);
+    }
+  });
+}
+
+function ckCollapseAll() {
+  var state = {};
+  ['both','nearSupport','prime','other','momentum','summaryStats','failed'].forEach(function(k) { state[k] = true; });
+  _ckSaveCollapseState(state);
+  _ckApplyCollapsibleState();
+}
+
+function ckExpandAll() {
+  _ckSaveCollapseState({});
+  _ckApplyCollapsibleState();
+}
+
+// Font Size
+function ckSetFontSize(size) {
+  document.documentElement.style.setProperty('--ck-font-size', size);
+  try { localStorage.setItem('ck_font_size', size); } catch {}
+}
+function ckSetHeaderFont(size) {
+  document.documentElement.style.setProperty('--ck-header-font-size', size);
+  try { localStorage.setItem('ck_header_font_size', size); } catch {}
+}
+function _ckRestoreFontSize() {
+  try {
+    var fs = localStorage.getItem('ck_font_size');
+    if (fs) { document.documentElement.style.setProperty('--ck-font-size', fs); var s = document.getElementById('ckFontSizeSelect'); if (s) s.value = fs; }
+    var hs = localStorage.getItem('ck_header_font_size');
+    if (hs) { document.documentElement.style.setProperty('--ck-header-font-size', hs); var s2 = document.getElementById('ckHeaderFontSelect'); if (s2) s2.value = hs; }
+  } catch {}
+}
+
+// Init: add click handlers to section headers
+function _ckInitCollapsibleHeaders() {
+  var headerBodyMap = {
+    'chartinkBothSection': 'ckBody_both',
+    'chartinkNearSupportSection': 'ckBody_nearSupport',
+    'chartinkPrimeSection': 'ckBody_prime',
+    'chartinkOtherSection': 'ckBody_other',
+    'chartinkMomentumSection': 'ckBody_momentum',
+  };
+  for (var secId in headerBodyMap) {
+    var sec = document.getElementById(secId);
+    if (!sec) continue;
+    var header = sec.querySelector('.ck-card-header');
+    if (!header || header.getAttribute('onclick')) continue;
+    (function(key) {
+      header.addEventListener('click', function(e) {
+        if (e.target.closest('button') || e.target.closest('select') || e.target.closest('a')) return;
+        ckToggleCollapsible(key);
+      });
+    })(headerBodyMap[secId].replace('ckBody_', ''));
+  }
+  _ckApplyCollapsibleState();
+  _ckRestoreFontSize();
+}
+setTimeout(_ckInitCollapsibleHeaders, 250);
+
+// Patch _ckApplySectionToggles to also refresh collapse chevrons
+var _origCkApplySectionToggles = _ckApplySectionToggles;
+_ckApplySectionToggles = function() {
+  _origCkApplySectionToggles();
+  _ckApplyCollapsibleState();
+};
+
+
+// ═══════════════════════════════════════════════════════════
+// Section Toggle State (persisted in localStorage)
+// ═══════════════════════════════════════════════════════════
+const CK_SECTION_TOGGLES_KEY = 'ck_section_toggles';
+const CK_SECTION_DEFAULTS = {
+  prime: true,
+  other: false,
+  momentum: true,
+  nearSupport: true,
+  both: true,
+  failed: false,
+};
+
+function _ckLoadSectionToggles() {
+  try { return JSON.parse(localStorage.getItem(CK_SECTION_TOGGLES_KEY)); } catch { return null; }
+}
+function _ckSaveSectionToggles(t) {
+  try { localStorage.setItem(CK_SECTION_TOGGLES_KEY, JSON.stringify(t)); } catch {}
+}
+function _ckGetSectionVisible(key) {
+  var t = _ckLoadSectionToggles();
+  return t ? (t[key] !== false) : (CK_SECTION_DEFAULTS[key] !== false);
+}
+function _ckToggleSection(key) {
+  var t = _ckLoadSectionToggles() || Object.assign({}, CK_SECTION_DEFAULTS);
+  t[key] = !t[key];
+  _ckSaveSectionToggles(t);
+  _ckApplySectionToggles();
+}
+function _ckApplySectionToggles() {
+  var t = _ckLoadSectionToggles() || CK_SECTION_DEFAULTS;
+  var map = {
+    prime:      { s: 'chartinkPrimeSection',      p: 'ckTogglePrime' },
+    other:      { s: 'chartinkOtherSection',      p: 'ckToggleOther' },
+    momentum:   { s: 'chartinkMomentumSection',   p: 'ckToggleMomentum' },
+    nearSupport:{ s: 'chartinkNearSupportSection',p: 'ckToggleNearSupport' },
+    both:       { s: 'chartinkBothSection',       p: 'ckToggleBoth' },
+    failed:     { s: 'chartinkFailedSection',     p: 'ckToggleFailed' },
+  };
+  for (var key in map) {
+    var vis = t[key] !== false;
+    var secEl = document.getElementById(map[key].s);
+    if (secEl) secEl.style.display = vis ? '' : 'none';
+    var pillEl = document.getElementById(map[key].p);
+    if (pillEl) pillEl.classList.toggle('active', vis);
+  }
+}
+function _ckToggleSectionBody(sectionId, bodyId, chevronId) {
+  var body = document.getElementById(bodyId);
+  var chev = document.getElementById(chevronId);
+  if (body) body.classList.toggle('collapsed');
+  if (chev) chev.classList.toggle('rotated');
+}
+function _ckUpdateTogglePillCounts(counts) {
+  var m = { prime: counts.prime||0, other: counts.other||0, momentum: counts.momentum||0,
+            nearSupport: counts.nearSupport||0, both: counts.both||0, failed: counts.failed||0 };
+  for (var key in m) {
+    var el = document.getElementById('ckToggleCount_' + key);
+    if (el) el.textContent = m[key] > 0 ? m[key] : '';
+  }
+}
+
+// Apply section toggle state on page load
+setTimeout(function() { _ckApplySectionToggles(); }, 100);
+
 async function clearChartinkResults() {
   if (!confirm('Clear ALL stored signals and history? This cannot be undone.')) return;
   try {
@@ -6973,6 +7518,9 @@ function toggleChartinkFailed() {
   const ch = document.getElementById('chartinkFailedChevron');
   c.classList.toggle('hidden');
   ch.style.transform = c.classList.contains('hidden') ? '' : 'rotate(180deg)';
+  var state = _ckLoadCollapseState();
+  state['failed'] = !c.classList.contains('hidden');
+  _ckSaveCollapseState(state);
 }
 
 // ═══════════════════════════════════════════════════════════

@@ -135,6 +135,11 @@ class _ConnectionPool:
         conn = self._get_conn()
         return conn.execute(sql, params).fetchone()
 
+    def executescript(self, sql: str):
+        """Execute multiple SQL statements (e.g., schema)."""
+        conn = self._get_conn()
+        conn.executescript(sql)
+
 
 # ── Singleton ────────────────────────────────────────────────────────────────
 _pool: Optional[_ConnectionPool] = None

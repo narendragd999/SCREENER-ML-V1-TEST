@@ -1,50 +1,49 @@
 """
-TensorFlow ML Stock Intelligence Service — INTEGRATED EDITION
-=============================================================
-This is the complete, integrated ml_service.py that combines:
+TensorFlow ML Stock Intelligence Service — INTEGRATED EDITION v3.0
+===================================================================
+COMPLETE integration with all 3 layers:
 
-  1. Original functionality (port 8001):
-     • Chartink/EMA9 signal ingestion
-     • ML predictions (TF models + intelligent_scoring fallback)
-     • Per-stock deep analysis
-     • Paper trading with order lifecycle
-     • Multi-stock scanner
+  Layer 1: Original functionality (port 8001)
+    • Chartink/EMA9 signal ingestion
+    • ML predictions (TF models + intelligent_scoring fallback)
+    • Per-stock deep analysis with pattern recognition
+    • Multi-stock scanner for 3% target strategy
+    • Paper trading with order lifecycle (PENDING→EXECUTED→CLOSED)
+    • Order monitor (live price tracking during market hours)
 
-  2. Continuous Learning Pipeline (NEW):
-     • SQLite DB replacing all JSON files
-     • Outcome tracking — every prediction is verified 5 days later
-     • Walk-forward validation (no data leakage)
-     • Versioned model registry with promotion gate + rollback
-     • Incremental fine-tune every 6 hours
-     • Weekly full retrain (Sunday 2 AM IST)
-     • Daily outcome resolution (4 PM IST)
-     • Hourly drift detection (concept + feature + data staleness)
-     • 17 new monitoring endpoints under /api/ml-monitor/*
-     • Delta data downloads (30x faster than full re-download)
-     • Feature caching per (ticker, date)
+  Layer 2: Continuous Learning Pipeline
+    • SQLite DB replacing all JSON files (WAL mode)
+    • Outcome tracking — every prediction verified 5 days later
+    • Walk-forward validation (no data leakage)
+    • Versioned model registry with promotion gate + rollback
+    • Incremental fine-tune every 6 hours
+    • Weekly full retrain (Sunday 2 AM IST)
+    • Daily outcome resolution (4 PM IST)
+    • Hourly drift detection (concept + feature + data staleness)
+    • 17 monitoring endpoints under /api/ml-monitor/*
+    • Delta data downloads (30x faster than full re-download)
+    • Feature caching per (ticker, date)
+
+  Layer 3: Historical Performance Pipeline (NEW)
+    • 10-year backtest engine (250K+ predictions per run)
+    • Per-stock accuracy stats (hit rate, Sharpe, profit factor)
+    • Model version comparison (v012 vs v011 vs v010...)
+    • Trade log with HIT/MISS/RUNNING status
+    • Accuracy trends over time (weekly/monthly buckets)
+    • 11 endpoints under /api/historical-performance/*
+    • Dashboard at /historical-performance (6 tabs with charts)
+    • Nightly aggregation (2 AM IST)
 
 Run:
     python ml_service.py
 
-Endpoints (in addition to original):
-    /api/ml-monitor/dashboard
-    /api/ml-monitor/accuracy?days=7
-    /api/ml-monitor/accuracy/trend?days=30
-    /api/ml-monitor/predictions/recent
-    /api/ml-monitor/predictions/pending
-    /api/ml-monitor/models
-    /api/ml-monitor/models/production
-    /api/ml-monitor/models/{version}/promote
-    /api/ml-monitor/models/rollback/{model_type}
-    /api/ml-monitor/training/history
-    /api/ml-monitor/training/trigger-fine-tune
-    /api/ml-monitor/training/trigger-full-retrain
-    /api/ml-monitor/alerts
-    /api/ml-monitor/drift/check
-    /api/ml-monitor/outcomes/resolve
-    /api/ml-monitor/outcomes/stats
-    /api/ml-monitor/data/staleness
-    /api/bootstrap-training-data  (call once after install)
+Visit:
+    http://localhost:8001/                                  → ML Dashboard
+    http://localhost:8001/stock-analysis                    → Per-Stock Analysis
+    http://localhost:8001/historical-performance            → Historical Performance (NEW)
+    http://localhost:8001/api/health                        → Health check
+    http://localhost:8001/api/ml-monitor/dashboard          → CL monitoring
+    http://localhost:8001/api/historical-performance/dashboard → HP dashboard data
 """
 
 import os
@@ -72,11 +71,18 @@ from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 
+# ── Suppress noisy yfinance logs (they spam "possibly delisted" warnings) ──
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('apscheduler.executors.default').setLevel(logging.WARNING)
+
 # ── Ensure service modules are importable ──
 BASE_DIR = Path(__file__).parent
 sys.path.insert(0, str(BASE_DIR))
 
-# ── Optional ML model imports (graceful fallback to intelligent scoring) ──
+# ═══════════════════════════════════════════════════════════════════════════
+#  LAYER 1: ORIGINAL ML MODELS (with intelligent_scoring fallback)
+# ═══════════════════════════════════════════════════════════════════════════
 HAS_ML_MODELS = False
 try:
     from ml_features import extract_features, FEATURE_NAMES, FEATURE_STATS
@@ -143,7 +149,7 @@ except ImportError as e:
 from ml_stock_analyzer import analyze_stock, scan_stocks_for_3pct
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CONTINUOUS LEARNING PIPELINE (NEW)
+#  LAYER 2: CONTINUOUS LEARNING PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════
 HAS_CONTINUOUS_LEARNING = False
 try:
@@ -172,6 +178,29 @@ _feature_store: Optional[FeatureStore] = None
 _model_registry: Optional[ModelRegistry] = None
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  LAYER 3: HISTORICAL PERFORMANCE PIPELINE (NEW)
+# ═══════════════════════════════════════════════════════════════════════════
+HAS_HISTORICAL_PERFORMANCE = False
+_HISTORICAL_PERFORMANCE_ERROR = None
+try:
+    from backtest_engine import BacktestEngine, get_engine
+    from accuracy_aggregator import AccuracyAggregator, get_aggregator
+    from historical_performance_api import create_historical_performance_router
+    HAS_HISTORICAL_PERFORMANCE = True
+except Exception as e:
+    import logging as _logging
+    import traceback as _tb
+    _HISTORICAL_PERFORMANCE_ERROR = str(e)
+    _log = _logging.getLogger("ml_service")
+    _log.warning(f"[Startup] Historical performance modules failed to load: {e}")
+    _log.warning(f"[Startup] Traceback: {_tb.format_exc()}")
+    _log.warning("[Startup] Historical performance feature disabled. "
+                 "Make sure these 5 files are in the same directory as ml_service.py: "
+                 "backtest_engine.py, accuracy_aggregator.py, "
+                 "historical_performance_api.py, historical_performance.html, "
+                 "db_schema_v2.sql")
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════
 DATA_DIR = BASE_DIR / "data"
@@ -190,11 +219,11 @@ DEFAULT_CONFIG = {
     "target_pct": 3.0,
     "lookahead_days": 5,
     "min_data_bars": 200,
-    "max_training_tickers": 0,
+    "max_training_tickers": 100,
     "auto_train_on_startup": True,
     "chartink_auto_ingest": True,
     "chartink_poll_interval_min": 5,
-    # NEW: continuous learning settings
+    # Continuous learning settings
     "continuous_learning_enabled": True,
     "cl_fine_tune_interval_hours": 6,
     "cl_full_retrain_day_of_week": 6,    # Sunday
@@ -202,6 +231,9 @@ DEFAULT_CONFIG = {
     "cl_outcome_resolve_hour": 16,       # 4 PM IST
     "cl_drift_check_interval_min": 60,
     "cl_bootstrap_max_tickers": 50,
+    # Historical performance settings
+    "historical_performance_enabled": True,
+    "hp_aggregation_hour": 2,            # 2 AM IST (nightly)
 }
 
 def load_config() -> dict:
@@ -234,6 +266,8 @@ if HAS_ML_MODELS:
     logger.info("[Startup] TensorFlow ML models loaded successfully.")
 if HAS_CONTINUOUS_LEARNING:
     logger.info("[Startup] Continuous learning pipeline loaded successfully.")
+if HAS_HISTORICAL_PERFORMANCE:
+    logger.info("[Startup] Historical performance pipeline loaded successfully.")
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  IN-MEMORY STORE (legacy — being phased out by SQLite)
@@ -275,7 +309,7 @@ def download_ticker_data(ticker: str, period: str = "10y") -> Optional[pd.DataFr
     Uses DeltaDownloader (SQLite-backed) if continuous learning is available,
     falling back to the legacy yfinance-with-memory-cache approach otherwise.
     """
-    # NEW: prefer delta downloader
+    # Prefer delta downloader
     if HAS_CONTINUOUS_LEARNING and _delta_downloader is not None:
         try:
             df = _delta_downloader.update_ticker(ticker)
@@ -297,7 +331,11 @@ def download_ticker_data(ticker: str, period: str = "10y") -> Optional[pd.DataFr
             hist = t.history(period=period, auto_adjust=True)
             if hist is not None and not hist.empty and len(hist) >= 100:
                 df = hist[["Open", "High", "Low", "Close", "Volume"]].copy()
-                df = df.dropna(how="all")
+                # FIX: Drop rows where ANY OHLC value is NaN (NOT NULL constraint)
+                df = df.dropna(subset=["Open", "High", "Low", "Close"])
+                df["Volume"] = df["Volume"].fillna(0)
+                if len(df) < 50:
+                    continue
                 with _yf_lock:
                     _yf_cache[cache_key] = {"df": df, "ts": time.time()}
                 return df.copy()
@@ -310,7 +348,7 @@ def download_tickers_batch(tickers: List[str]) -> Dict[str, pd.DataFrame]:
     """Download data for multiple tickers. Uses concurrent delta downloader if available."""
     if HAS_CONTINUOUS_LEARNING and _delta_downloader is not None:
         try:
-            return _delta_downloader.update_tickers_batch(tickers, max_workers=10)
+            return _delta_downloader.update_tickers_batch(tickers, max_workers=3)
         except Exception as e:
             logger.warning(f"[Delta] batch failed, falling back: {e}")
 
@@ -384,7 +422,7 @@ async def _fetch_ema9_signals_from_main() -> List[Dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PREDICTION LOGGING (NEW — for outcome tracking)
+#  PREDICTION LOGGING (for outcome tracking)
 # ═══════════════════════════════════════════════════════════════════════════
 def _get_current_model_version() -> str:
     """Get the version string of the current production model."""
@@ -401,10 +439,7 @@ def _get_current_model_version() -> str:
 def _log_prediction_to_db(ticker: str,
                            prediction: Dict,
                            source: str = "manual") -> Optional[int]:
-    """Log a prediction to the database for outcome tracking.
-
-    Returns the prediction ID, or None if logging failed.
-    """
+    """Log a prediction to the database for outcome tracking."""
     if not HAS_CONTINUOUS_LEARNING:
         return None
     try:
@@ -545,7 +580,7 @@ def _generate_decisions(signals: List[Dict], predictions: Dict[str, Dict]) -> Li
             "timestamp": dt.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-        # NEW: log decision's prediction to DB for outcome tracking
+        # Log decision's prediction to DB for outcome tracking
         if HAS_CONTINUOUS_LEARNING:
             _log_prediction_to_db(ticker, {
                 **ml_pred,
@@ -650,7 +685,7 @@ def _check_and_execute_orders():
                 o["status"] = "CLOSED"
                 o["exit_price"] = exit_price
                 o["exit_date"] = now_str
-                if action == "BUY":
+                if o["action"] == "BUY":
                     o["pnl"] = round((exit_price - entry) * o["quantity"], 2)
                     o["pnl_pct"] = round((exit_price - entry) / entry * 100, 2)
                 else:
@@ -666,15 +701,12 @@ def _check_and_execute_orders():
 
 
 def _background_fine_tune_legacy():
-    """Legacy fine-tune task (every 30 min). Kept for backward compatibility.
-    The continuous_learner handles the proper fine-tune every 6 hours.
-    """
+    """Legacy fine-tune task (every 30 min). Skipped if continuous learner is active."""
     if model_manager.is_training:
         return
 
     if HAS_CONTINUOUS_LEARNING and _continuous_learner is not None:
-        # Skip legacy fine-tune — continuous learner handles it
-        return
+        return  # continuous learner handles this
 
     tickers = get_fno_tickers()[:config.get("max_training_tickers", 100)]
     if not tickers:
@@ -722,7 +754,6 @@ async def _background_chartink_ingest():
 
     for ticker, pred in predictions.items():
         _prediction_cache[ticker] = pred
-        # NEW: log each prediction to DB
         if HAS_CONTINUOUS_LEARNING:
             _log_prediction_to_db(ticker, pred, source="chartink_ingest")
 
@@ -756,29 +787,24 @@ def _init_continuous_learning():
         return False
 
     try:
-        # Initialize delta downloader
         _delta_downloader = get_downloader()
         logger.info("[CL] DeltaDownloader initialized")
 
-        # Initialize model registry
         _model_registry = get_registry()
         logger.info("[CL] ModelRegistry initialized")
 
-        # Initialize feature store (requires feature extractor)
         if HAS_ML_MODELS and extract_features is not None:
             _feature_store = get_feature_store(feature_extractor=extract_features)
             logger.info("[CL] FeatureStore initialized")
         else:
             logger.info("[CL] FeatureStore skipped (no TF feature extractor)")
 
-        # Initialize outcome tracker
         _outcome_tracker = OutcomeTracker(
             lookahead_days=config.get("lookahead_days", 5),
             target_pct=config.get("target_pct", 3.0),
         )
         logger.info("[CL] OutcomeTracker initialized")
 
-        # Initialize continuous learner (wraps existing model_manager)
         if HAS_ML_MODELS and extract_features is not None:
             _continuous_learner = ContinuousLearner(
                 model_manager=model_manager,
@@ -786,14 +812,13 @@ def _init_continuous_learning():
                 target_pct=config.get("target_pct", 3.0),
                 lookahead_days=config.get("lookahead_days", 5),
             )
-            # Register as singleton in continuous_learner module
+            # Register as singleton so monitoring_api can access it via get_learner()
             import continuous_learner as cl_module
             cl_module._learner = _continuous_learner
-            logger.info("[CL] ContinuousLearner initialized")
+            logger.info("[CL] ContinuousLearner initialized (singleton registered)")
         else:
             logger.info("[CL] ContinuousLearner skipped (no TF models)")
 
-        # Initialize drift detector
         _drift_detector = DriftDetector(
             feature_store=_feature_store,
             on_drift_callback=_on_drift_alert,
@@ -833,12 +858,61 @@ def _on_critical_drift_alert(alert: Dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  HISTORICAL PERFORMANCE INITIALIZATION (NEW)
+# ═══════════════════════════════════════════════════════════════════════════
+def _init_historical_performance():
+    """Initialize the historical performance pipeline. Called once at startup."""
+    if not HAS_HISTORICAL_PERFORMANCE:
+        logger.warning("[HP] Historical performance modules not available — skipping init")
+        return False
+
+    try:
+        # Apply v2 schema (adds 3 tables: historical_predictions,
+        # historical_accuracy, backtest_runs)
+        schema_v2_path = BASE_DIR / "db_schema_v2.sql"
+        if schema_v2_path.exists():
+            with open(schema_v2_path) as f:
+                schema_sql = f.read()
+            db.pool.executescript(schema_sql)
+            logger.info("[HP] Historical performance schema applied (3 new tables)")
+        else:
+            logger.warning(f"[HP] Schema file not found: {schema_v2_path}")
+
+        # Initialize backtest engine
+        try:
+            _engine = get_engine()  # try existing singleton
+            logger.info("[HP] BacktestEngine loaded (existing singleton)")
+        except ValueError:
+            # First time — initialize with model_manager.predict
+            try:
+                from ml_features import extract_features as fe
+            except ImportError:
+                fe = None
+            _engine = get_engine(
+                model_predict_fn=model_manager.predict,
+                feature_extractor=fe,
+            )
+            logger.info("[HP] BacktestEngine initialized (new instance)")
+
+        # Initialize accuracy aggregator
+        _agg = get_aggregator()
+        logger.info("[HP] AccuracyAggregator initialized")
+
+        return True
+    except Exception as e:
+        logger.error(f"[HP] Initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  FASTAPI APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════
 app = FastAPI(
-    title="TensorFlow ML Stock Intelligence — Integrated Edition",
-    description="ML-powered stock analysis with continuous learning pipeline",
-    version="2.0.0",
+    title="TensorFlow ML Stock Intelligence — Integrated Edition v3.0",
+    description="ML-powered stock analysis with continuous learning + historical performance",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -857,10 +931,11 @@ scheduler = BackgroundScheduler()
 @app.on_event("startup")
 async def startup_event():
     logger.info("=" * 70)
-    logger.info("  ML Stock Intelligence Service starting (Integrated Edition v2.0)")
+    logger.info("  ML Stock Intelligence Service starting (Integrated Edition v3.0)")
     logger.info(f"  Port: 8001 | Main app: {config['main_app_url']}")
     logger.info(f"  TF Models: {'YES' if HAS_ML_MODELS else 'NO (using intelligent_scoring)'}")
     logger.info(f"  Continuous Learning: {'YES' if HAS_CONTINUOUS_LEARNING else 'NO'}")
+    logger.info(f"  Historical Performance: {'YES' if HAS_HISTORICAL_PERFORMANCE else 'NO'}")
     logger.info("=" * 70)
 
     # ── Initialize continuous learning pipeline ──
@@ -893,11 +968,10 @@ async def startup_event():
         replace_existing=True,
     )
 
-    # ── NEW: Continuous learning scheduler jobs ──
+    # ── Continuous learning scheduler jobs ──
     if cl_ok:
         try:
             from apscheduler.triggers.cron import CronTrigger
-            from apscheduler.triggers.interval import IntervalTrigger
 
             # 1. Fine-tune every 6 hours
             if _continuous_learner is not None:
@@ -935,6 +1009,40 @@ async def startup_event():
 
         except Exception as e:
             logger.error(f"[Startup] CL scheduler setup failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # ── Historical Performance initialization (NEW) ──
+    hp_ok = False
+    if config.get("historical_performance_enabled", True) and HAS_HISTORICAL_PERFORMANCE:
+        hp_ok = _init_historical_performance()
+    else:
+        logger.info("[Startup] Historical performance disabled in config")
+
+    if hp_ok:
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+
+            # Schedule nightly aggregation (2 AM IST)
+            scheduler.add_job(
+                lambda: get_aggregator().aggregate_all(),
+                trigger=CronTrigger(
+                    hour=config.get("hp_aggregation_hour", 2),
+                    minute=0,
+                    timezone="Asia/Kolkata",
+                ),
+                id="historical_aggregation",
+                replace_existing=True,
+            )
+            logger.info(f"[Scheduler] Historical aggregation: daily at "
+                        f"{config.get('hp_aggregation_hour', 2)}:00 IST")
+
+            # Mount the historical performance API
+            app.include_router(create_historical_performance_router())
+            logger.info("[Startup] Historical Performance API mounted at /api/historical-performance/*")
+
+        except Exception as e:
+            logger.error(f"[Startup] HP scheduler setup failed: {e}")
             import traceback
             traceback.print_exc()
 
@@ -982,13 +1090,11 @@ class TrainRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────
-#  PREDICTION ENDPOINTS (NOW LOGS EVERY PREDICTION TO DB)
+#  PREDICTION ENDPOINTS (logs every prediction to DB)
 # ─────────────────────────────────────────────────────────────────
 @app.get("/api/predict/{ticker}")
 async def predict_ticker(ticker: str, source: str = "manual"):
-    """Get ML predictions for a single ticker.
-    NEW: Every prediction is logged to the database for outcome tracking.
-    """
+    """Get ML predictions for a single ticker. Logs to DB for outcome tracking."""
     ticker = ticker.strip().upper()
     df = download_ticker_data(ticker)
     if df is None or len(df) < 100:
@@ -997,7 +1103,6 @@ async def predict_ticker(ticker: str, source: str = "manual"):
     prediction = model_manager.predict(df)
     prediction["ticker"] = ticker
 
-    # NEW: Log prediction for outcome tracking
     if HAS_CONTINUOUS_LEARNING:
         _log_prediction_to_db(ticker, prediction, source=source)
 
@@ -1006,9 +1111,7 @@ async def predict_ticker(ticker: str, source: str = "manual"):
 
 @app.post("/api/predict/batch")
 async def predict_batch(req: PredictRequest):
-    """Get ML predictions for multiple tickers.
-    NEW: Every prediction is logged to the database.
-    """
+    """Get ML predictions for multiple tickers. Logs every prediction."""
     tickers = [t.strip().upper() for t in req.tickers if t.strip()][:200]
     if not tickers:
         raise HTTPException(400, "No tickers provided")
@@ -1018,7 +1121,6 @@ async def predict_batch(req: PredictRequest):
 
     for ticker, pred in predictions.items():
         _prediction_cache[ticker] = pred
-        # NEW: log each prediction
         if HAS_CONTINUOUS_LEARNING:
             _log_prediction_to_db(ticker, pred, source="batch")
 
@@ -1090,7 +1192,6 @@ async def ingest_chartink_signals(req: IngestRequest):
 
     for ticker, pred in predictions.items():
         _prediction_cache[ticker] = pred
-        # NEW: log each prediction
         if HAS_CONTINUOUS_LEARNING:
             _log_prediction_to_db(ticker, pred, source=req.source)
 
@@ -1197,6 +1298,7 @@ async def get_ml_config():
         "config": config,
         "feature_stats_available": len(FEATURE_STATS) if HAS_ML_MODELS else 0,
         "continuous_learning_enabled": HAS_CONTINUOUS_LEARNING and config.get("continuous_learning_enabled", True),
+        "historical_performance_enabled": HAS_HISTORICAL_PERFORMANCE and config.get("historical_performance_enabled", True),
     }
 
 
@@ -1218,16 +1320,97 @@ async def health():
     return {
         "status": "healthy",
         "service": "tensorflow-ml-stock-intelligence",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "port": 8001,
         "scoring_mode": "tensorflow_ml" if HAS_ML_MODELS else "intelligent_scoring_fallback",
         "continuous_learning": HAS_CONTINUOUS_LEARNING,
+        "historical_performance": HAS_HISTORICAL_PERFORMANCE,
         "models_loaded": {k: v is not None for k, v in model_manager.models.items()},
         "prediction_cache_size": len(_prediction_cache),
         "decisions_stored": len(_ml_decisions),
         "chartink_signals": len(_chartink_signals),
         "scheduler_running": scheduler.running,
+        "scheduler_jobs": len(scheduler.get_jobs()) if scheduler.running else 0,
     }
+
+
+@app.get("/api/diagnostics")
+async def diagnostics():
+    """Diagnostics endpoint — shows which modules loaded and which failed.
+
+    Use this to debug missing features. If a module shows loaded=false,
+    check the error message to find out why.
+    """
+    import os
+    diag = {
+        "service_version": "3.0.0",
+        "base_dir": str(BASE_DIR),
+        "python_version": sys.version,
+        "layers": {
+            "layer1_tf_models": {
+                "loaded": HAS_ML_MODELS,
+                "description": "TensorFlow ML models + intelligent_scoring fallback",
+            },
+            "layer2_continuous_learning": {
+                "loaded": HAS_CONTINUOUS_LEARNING,
+                "description": "Outcome tracking, drift detection, continuous training",
+            },
+            "layer3_historical_performance": {
+                "loaded": HAS_HISTORICAL_PERFORMANCE,
+                "description": "10-year backtest engine + accuracy stats",
+                "error": _HISTORICAL_PERFORMANCE_ERROR,
+            },
+        },
+        "files_present": {},
+        "scheduler_jobs": [],
+    }
+
+    # Check which files exist in BASE_DIR
+    expected_files = [
+        "ml_service.py", "ml_features.py", "ml_models.py",
+        "ml_stock_analyzer.py", "intelligent_scoring.py",
+        # CL files
+        "db.py", "schema.sql", "delta_downloader.py", "feature_store.py",
+        "outcome_tracker.py", "walk_forward.py", "model_registry.py",
+        "continuous_learner.py", "drift_detector.py", "monitoring_api.py",
+        # HP files (NEW)
+        "backtest_engine.py", "accuracy_aggregator.py",
+        "historical_performance_api.py", "historical_performance.html",
+        "db_schema_v2.sql",
+        # HTML files
+        "ml_dashboard.html", "ml_stock_analysis.html",
+    ]
+    for f in expected_files:
+        path = BASE_DIR / f
+        diag["files_present"][f] = {
+            "exists": path.exists(),
+            "size_bytes": path.stat().st_size if path.exists() else 0,
+        }
+
+    # List scheduler jobs
+    if scheduler.running:
+        for job in scheduler.get_jobs():
+            diag["scheduler_jobs"].append({
+                "id": job.id,
+                "name": job.name,
+                "next_run": str(job.next_run_time) if job.next_run_time else None,
+            })
+
+    # Try importing each HP module individually for detailed error reporting
+    if not HAS_HISTORICAL_PERFORMANCE:
+        diag["layer3_import_tests"] = {}
+        for module_name in ["backtest_engine", "accuracy_aggregator", "historical_performance_api"]:
+            try:
+                __import__(module_name)
+                diag["layer3_import_tests"][module_name] = {"status": "ok"}
+            except Exception as e:
+                diag["layer3_import_tests"][module_name] = {
+                    "status": "failed",
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                }
+
+    return diag
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1244,7 +1427,6 @@ async def stock_deep_analysis(ticker: str):
     ml_prediction = model_manager.predict(df)
     ml_prediction["ticker"] = ticker
 
-    # NEW: log this prediction
     if HAS_CONTINUOUS_LEARNING:
         _log_prediction_to_db(ticker, ml_prediction, source="stock_analysis")
 
@@ -1265,7 +1447,6 @@ async def stock_analysis_batch(background_tasks: BackgroundTasks):
 
     ml_predictions = model_manager.predict_batch(ticker_dfs)
 
-    # NEW: log all predictions
     if HAS_CONTINUOUS_LEARNING:
         for ticker, pred in ml_predictions.items():
             _log_prediction_to_db(ticker, pred, source="batch_scanner")
@@ -1300,7 +1481,6 @@ async def stock_quick_analysis(ticker: str):
 
     ml_pred["ticker"] = ticker
 
-    # NEW: log prediction
     if HAS_CONTINUOUS_LEARNING:
         _log_prediction_to_db(ticker, ml_pred, source="quick_analysis")
 
@@ -1315,7 +1495,7 @@ async def available_tickers():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PAPER TRADING — Order Management (JSON file persistence — legacy)
+#  PAPER TRADING — Order Management
 # ═══════════════════════════════════════════════════════════════════════════
 ORDERS_FILE = DATA_DIR / "paper_trades.json"
 _orders_lock = threading.Lock()
@@ -1565,7 +1745,7 @@ async def orders_summary():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  BOOTSTRAP TRAINING DATA (NEW — call once after install)
+#  BOOTSTRAP TRAINING DATA (one-time call to seed historical labels)
 # ═══════════════════════════════════════════════════════════════════════════
 @app.post("/api/bootstrap-training-data")
 async def bootstrap_training_data(background_tasks: BackgroundTasks,
@@ -1573,11 +1753,8 @@ async def bootstrap_training_data(background_tasks: BackgroundTasks,
     """Bootstrap the training queue with historical labels.
 
     Call this ONCE after installing the continuous learning pipeline.
-    It walks through historical OHLCV data and creates labeled training
-    samples for every bar where we have 5 days of future outcome data.
-
-    This populates the training_queue so the first fine-tune cycle has
-    data to work with.
+    Walks through historical OHLCV and creates labeled training samples
+    for every bar where we have 5 days of future outcome data.
     """
     if not HAS_CONTINUOUS_LEARNING:
         raise HTTPException(503, "Continuous learning modules not available")
@@ -1618,7 +1795,7 @@ async def bootstrap_training_data(background_tasks: BackgroundTasks,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DASHBOARD (serve HTML)
+#  DASHBOARD (serve HTML pages)
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
@@ -1639,6 +1816,15 @@ async def stock_analysis_page():
         except UnicodeDecodeError:
             return analysis_path.read_text(encoding="latin-1")
     return HTMLResponse("<h1>Stock Analysis page not found.</h1>")
+
+
+@app.get("/historical-performance", response_class=HTMLResponse)
+async def historical_performance_page():
+    """Serve the Historical Performance Dashboard (10-year backtest results)."""
+    page_path = BASE_DIR / "historical_performance.html"
+    if page_path.exists():
+        return page_path.read_text(encoding="utf-8")
+    return HTMLResponse("<h1>historical_performance.html not found.</h1>")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

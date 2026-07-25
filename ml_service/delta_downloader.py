@@ -57,9 +57,10 @@ def _get_yf():
 # ── Constants ────────────────────────────────────────────────────────────────
 DEFAULT_PERIOD = "10y"        # initial download depth
 DEFAULT_INTERVAL = "1d"
-RATE_LIMIT_SLEEP = 0.15       # seconds between API calls per ticker
-MAX_RETRIES = 3
+RATE_LIMIT_SLEEP = 0.5        # seconds between API calls per ticker (increased from 0.15)
+MAX_RETRIES = 5               # increased from 3
 CACHE_TTL_HOURS = 4           # in-memory cache TTL
+MAX_CONCURRENT_DOWNLOADS = 3  # reduced from 10 — yfinance rate limits aggressively
 
 
 class DeltaDownloader:
@@ -137,13 +138,13 @@ class DeltaDownloader:
 
     def update_tickers_batch(self,
                              tickers: List[str],
-                             max_workers: int = 10,
+                             max_workers: int = MAX_CONCURRENT_DOWNLOADS,
                              force_full: bool = False) -> Dict[str, pd.DataFrame]:
         """Update multiple tickers concurrently.
 
         Args:
             tickers: list of ticker symbols
-            max_workers: number of concurrent download threads
+            max_workers: number of concurrent download threads (default 3 — yfinance rate limits)
             force_full: if True, re-download full history for each ticker
 
         Returns:
@@ -231,11 +232,14 @@ class DeltaDownloader:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _download_full(self, ticker: str) -> Optional[pd.DataFrame]:
-        """Download full history for a ticker."""
+        """Download full history for a ticker. yfinance-compatible with retries."""
         yf = _get_yf()
+        last_error = None
         for suffix in [".NS", ".BO"]:
             for attempt in range(MAX_RETRIES):
                 try:
+                    # Add small delay before each attempt to avoid rate limiting
+                    time.sleep(RATE_LIMIT_SLEEP)
                     t = yf.Ticker(f"{ticker}{suffix}")
                     hist = t.history(period=DEFAULT_PERIOD, auto_adjust=True)
                     if hist is not None and not hist.empty and len(hist) >= 50:
@@ -244,14 +248,19 @@ class DeltaDownloader:
                         # Persist to DB
                         rows = self._df_to_rows(df)
                         db.upsert_ohlcv(ticker, rows)
-                        logger.info(f"[DeltaDownloader] {ticker}: full download "
+                        logger.info(f"[DeltaDownloader] {ticker}{suffix}: full download "
                                     f"{len(df)} bars")
                         return df
+                    else:
+                        last_error = "empty data"
                 except Exception as e:
+                    last_error = str(e)
                     if attempt < MAX_RETRIES - 1:
-                        time.sleep(1.0 * (attempt + 1))  # exponential backoff
+                        # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                        sleep_time = 2.0 ** attempt
+                        time.sleep(sleep_time)
                     continue
-        logger.warning(f"[DeltaDownloader] {ticker}: full download failed")
+        logger.warning(f"[DeltaDownloader] {ticker}: full download failed (last error: {last_error})")
         return None
 
     def _download_delta(self, ticker: str, last_date: str) -> Optional[pd.DataFrame]:

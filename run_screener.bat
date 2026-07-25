@@ -19,7 +19,7 @@ echo Starting SCREENER...
 echo ======================================
 
 D:
-cd /d "E:\application\Office-Scripts\SCRIPTS\SCREENER-ML-V1-TEST"
+cd /d "E:\application\Office-Scripts\SCRIPTS\SCREENER-ML-V1-TEST-01"
 
 python main.py
 

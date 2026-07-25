@@ -12,6 +12,13 @@ Fixes applied IN ema9_router.py (without modifying sma_router.py):
 import os, io, asyncio, datetime as dt_module, time, math, logging, pickle, json
 from typing import Optional, List, Dict
 import httpx
+import warnings as _warnings
+
+# Suppress noisy yfinance "possibly delisted" warnings that print to stdout.
+# These are harmless (the ticker just gets None data and moves to the failed
+# list), but with 2000+ tickers they flood the server console.
+_warnings.filterwarnings("ignore", message=".*possibly delisted.*")
+_warnings.filterwarnings("ignore", message=".*No data found.*")
 
 import numpy as np
 import pandas as pd
@@ -82,6 +89,7 @@ if not logger.handlers:
 DATA_DIR = "data"
 FNO_CSV  = "tickers.csv"
 ALL_CSV  = "tickers_all.csv"
+HEALTHY_CSV = "tickers-healthy-strict-4.csv"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Cache persistence directory — survives server restarts.
@@ -363,6 +371,7 @@ _load_cache_from_disk()
 # ─────────────────────────────────────────────────────────────
 _fno_df: Optional[pd.DataFrame] = None
 _all_df: Optional[pd.DataFrame] = None
+_healthy_df: Optional[pd.DataFrame] = None
 
 
 def _load_csv_df(csv_path: str) -> pd.DataFrame:
@@ -399,6 +408,30 @@ def _load_all_df() -> pd.DataFrame:
     if _all_df is None:
         _all_df = _load_csv_df(ALL_CSV)
     return _all_df
+
+
+def _load_healthy_df() -> pd.DataFrame:
+    """Load the pre-filtered healthy/strict ticker list.
+    This CSV contains only actively-traded NSE tickers — no delisted,
+    no suspended, no illiquid names. Used by the full-universe screener
+    to avoid wasting API calls on dead tickers.
+    Falls back to FNO list if the healthy CSV doesn't exist."""
+    global _healthy_df
+    if _healthy_df is not None:
+        return _healthy_df
+    # Try the healthy CSV first
+    healthy_path = os.path.join(DATA_DIR, HEALTHY_CSV)
+    if not os.path.exists(healthy_path):
+        healthy_path = HEALTHY_CSV  # try cwd
+    if os.path.exists(healthy_path):
+        _healthy_df = _load_csv_df(healthy_path)
+        logger.info(f"[TickerLoad] Loaded healthy ticker list: {len(_healthy_df)} symbols from {HEALTHY_CSV}")
+        if not _healthy_df.empty:
+            return _healthy_df
+    # Fallback: use FNO list if healthy CSV not found
+    logger.warning(f"[TickerLoad] {HEALTHY_CSV} not found — falling back to FNO list ({FNO_CSV})")
+    _healthy_df = _load_fno_df()
+    return _healthy_df
 
 
 # ─────────────────────────────────────────────────────────────
@@ -627,6 +660,209 @@ def _json_safe(obj):
 
 
 # ─────────────────────────────────────────────────────────────
+#  SWING LOW & STRUCTURAL LOW DETECTION
+# ─────────────────────────────────────────────────────────────
+#
+#  Computes the deepest unbroken swing low for a ticker — the most
+#  important level for stop-loss placement. Uses the Williams Fractal
+#  approach: a swing low is a bar whose Low is lower than both the
+#  preceding and following bars.
+#
+#  Returns two levels:
+#    • Recent swing low: the most recent (closest) unbroken swing low
+#    • Structural swing low: the DEEPEST unbroken swing low in the
+#      full lookback (the real trend-invalidation floor)
+#
+#  "Unbroken" means today's Close is still ABOVE that low — if Close
+#  has fallen below it, the low is considered broken and excluded.
+#
+#  Fields injected into the signal dict:
+#    swing_low_price, swing_low_date, swing_low_days_ago
+#    swing_pullback, swing_pullback_proximity_pct, swing_pullback_days_ago
+#    swing_pullback_is_higher_low, swing_pullback_score
+#    structural_swing_low_price, structural_swing_low_date, structural_swing_days_ago
+#    structural_swing_proximity_pct, structural_is_same_as_recent
+# ─────────────────────────────────────────────────────────────
+def _compute_swing_and_structural_low(df: pd.DataFrame, current_price: float) -> Dict:
+    """
+    Detect recent swing low and deepest structural (unbroken) swing low.
+    Returns a flat dict with all fields the frontend expects.
+    """
+    out: Dict = {
+        "swing_low_price":           None,
+        "swing_low_date":            None,
+        "swing_low_days_ago":        None,
+        "swing_pullback":            False,
+        "swing_pullback_proximity_pct": None,
+        "swing_pullback_days_ago":   None,
+        "swing_pullback_is_higher_low": None,
+        "swing_pullback_score":       0.0,
+        "structural_swing_low_price": None,
+        "structural_swing_low_date":  None,
+        "structural_swing_days_ago":  None,
+        "structural_swing_proximity_pct": None,
+        "structural_is_same_as_recent": None,
+    }
+
+    try:
+        if df is None or len(df) < 10 or current_price is None or current_price <= 0:
+            return out
+
+        n = len(df)
+        lows = df["Low"].values
+        highs = df["High"].values
+        closes = df["Close"].values
+        dates = df.index
+
+        # ── Step 1: Identify all swing lows (Williams Fractal) ──────
+        # A swing low at bar i: Low[i] < Low[i-1] AND Low[i] < Low[i+1]
+        all_swing_lows = []  # ALL swing lows (for structural low calc)
+        unbroken_swing_lows = []  # only unbroken ones (for pullback calc)
+        for i in range(1, n - 1):
+            if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:
+                sl_price = float(lows[i])
+                d = dates[i]
+                date_str = str(d.date()) if hasattr(d, "date") else str(d)[:10]
+                entry = (i, sl_price, date_str)
+                all_swing_lows.append(entry)
+                # Unbroken: today's close still above this low
+                if current_price >= sl_price:
+                    unbroken_swing_lows.append(entry)
+
+        if not all_swing_lows:
+            return out
+
+        # ── Step 2: Recent swing low (most recent UNBROKEN) ─────
+        # Use unbroken swing lows for pullback detection (entry timing)
+        swing_lows = unbroken_swing_lows
+        if not swing_lows:
+            # No unbroken lows — use all swing lows and mark proximity as negative
+            swing_lows = all_swing_lows
+        recent_idx, recent_price, recent_date = swing_lows[-1]
+        recent_days_ago = n - 1 - recent_idx
+
+        # Proximity: how far current price is ABOVE this swing low
+        recent_prox_pct = round((current_price - recent_price) / recent_price * 100, 2)
+
+        # Check if this is a "higher low" than the one before it
+        is_higher_low = None
+        if len(swing_lows) >= 2:
+            prev_price = swing_lows[-2][1]
+            is_higher_low = recent_price > prev_price
+
+        # Pullback score: higher when closer to swing low and recent
+        pullback_score = 0.0
+        if recent_prox_pct <= 5.0 and recent_days_ago <= 30:
+            # Score combines closeness (inverse of proximity) + recency
+            closeness = max(0, 5.0 - recent_prox_pct) / 5.0  # 0..1
+            recency = max(0, 30 - recent_days_ago) / 30.0    # 0..1
+            pullback_score = round(closeness * 0.7 + recency * 0.3, 3)
+
+        # A stock is in "pullback" mode if within 5% of recent swing low
+        is_pullback = recent_prox_pct <= 5.0
+
+        out["swing_low_price"]           = round(recent_price, 2)
+        out["swing_low_date"]            = recent_date
+        out["swing_low_days_ago"]        = recent_days_ago
+        out["swing_pullback"]            = is_pullback
+        out["swing_pullback_proximity_pct"] = recent_prox_pct
+        out["swing_pullback_days_ago"]   = recent_days_ago
+        out["swing_pullback_is_higher_low"] = is_higher_low
+        out["swing_pullback_score"]       = pullback_score
+
+        # ── Step 3: Structural swing low (most-touched SUPPORT zone) ──
+        # A structural low MUST be a SUPPORT level — meaning it must be
+        # at or BELOW the current price.  A swing low above the current
+        # price is resistance, not support.
+        #
+        # Among below-price swing lows, find the price zone that was
+        # TESTED THE MOST NUMBER OF TIMES.  A "touch" = another swing
+        # low within ±5% of the candidate's price.
+        # The cluster with most touches = the real structural support.
+        # Structural low = lowest price in that most-touched cluster.
+        #
+        # Tie-breaking: among clusters with equal touches, pick the one
+        # closest to current price (most actionable for stop placement).
+        #
+        # Relevance guard: only consider swing lows within 1200 bars.
+
+        STRUCTURAL_MAX_LOOKBACK = 1200
+        _cutoff_idx = max(0, n - 1 - STRUCTURAL_MAX_LOOKBACK)
+
+        # Only swing lows AT or BELOW current price (support, not resistance)
+        # and within the lookback window
+        _support_candidates = [
+            (i, p, d) for i, p, d in all_swing_lows
+            if p <= current_price and i >= _cutoff_idx
+        ]
+
+        if _support_candidates:
+            def _cluster_touches(swing_lows_list, target_price, pct_band=5.0):
+                """Count swing lows within ±pct_band% of target_price."""
+                lo = target_price * (1 - pct_band / 100)
+                hi = target_price * (1 + pct_band / 100)
+                return sum(1 for _, p, _ in swing_lows_list if lo <= p <= hi)
+
+            # Score each candidate: (touches, closeness_to_price, -price)
+            # Higher touches = better. If tied, closer to current = better.
+            # If still tied, lower price = better (deeper support).
+            best = None
+            best_score = (-1, 0.0, 0.0)
+            for idx, price, date in _support_candidates:
+                touches = _cluster_touches(_support_candidates, price)
+                closeness = -abs(current_price - price) / current_price
+                score = (touches, closeness, -price)
+                if score > best_score:
+                    best_score = score
+                    best = (idx, price, date)
+
+            # Find the LOWEST price within the same cluster (±5% of best)
+            _band_lo = best[1] * 0.95
+            _band_hi = best[1] * 1.05
+            _cluster_members = [
+                (i, p, d) for i, p, d in _support_candidates
+                if _band_lo <= p <= _band_hi
+            ]
+            deepest = min(_cluster_members, key=lambda x: x[1])
+            deepest_idx, deepest_price, deepest_date = deepest
+            deepest_days_ago = n - 1 - deepest_idx
+            struct_touches = len(_cluster_members)
+
+        else:
+            # No below-price swing low in lookback → absolute deepest
+            _recent_candidates = [
+                (i, p, d) for i, p, d in all_swing_lows if i >= _cutoff_idx
+            ]
+            if _recent_candidates:
+                deepest = min(_recent_candidates, key=lambda x: x[1])
+            else:
+                deepest = min(all_swing_lows, key=lambda x: x[1])
+            deepest_idx, deepest_price, deepest_date = deepest
+            deepest_days_ago = n - 1 - deepest_idx
+            struct_touches = 1
+
+        # Proximity from structural low (positive = price is above = normal)
+        struct_prox_pct = round((current_price - deepest_price) / deepest_price * 100, 2)
+
+        # Check if structural == recent (same swing low)
+        is_same = (deepest_idx == recent_idx)
+
+        out["structural_swing_low_price"]       = round(deepest_price, 2)
+        out["structural_swing_low_date"]         = deepest_date
+        out["structural_swing_days_ago"]         = deepest_days_ago
+        out["structural_swing_proximity_pct"]    = struct_prox_pct
+        out["structural_is_same_as_recent"]      = is_same
+        out["structural_touches"]               = struct_touches
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        # Return the default (all-None) dict on any error — graceful degradation
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────
 #  TREND DETECTION
 # ─────────────────────────────────────────────────────────────
 def _compute_trend(df: pd.DataFrame) -> Dict:
@@ -763,6 +999,7 @@ def _process_ticker_df(ticker: str, df: pd.DataFrame, max_candles_ago: int) -> D
     # value later for the SIGNAL branch.
     target_3pct = round(current_price * 1.03, 2)
     trend_data  = _compute_trend(df)
+    swing_data  = _compute_swing_and_structural_low(df, current_price)
 
     scan_start = max(1, n - max_candles_ago - 1)
     scan_end   = n - 2
@@ -797,6 +1034,7 @@ def _process_ticker_df(ticker: str, df: pd.DataFrame, max_candles_ago: int) -> D
             "above_sma50":   above_sma50,
             "target_3pct":   target_3pct,
             **trend_data,
+            **swing_data,
             # ── Momentum Sweep annotation (NO_SIGNAL branch) ──────────────────
             # Even with no fresh crossover, this ticker may already be
             # above 9EMA and forming higher-highs. The pipeline will
@@ -990,6 +1228,7 @@ def _process_ticker_df(ticker: str, df: pd.DataFrame, max_candles_ago: int) -> D
         "interval":                        "1d",
         "candles":                         candles,
         **trend_data,
+        **swing_data,
         # ── Momentum Sweep annotation (always present) ───────────────────────
         # Stocks ALREADY above 9EMA making higher-highs with intact HH-LL
         # structure. Captured even without a fresh 9EMA crossover.
@@ -3635,8 +3874,11 @@ async def _run_screen_pipeline(
 
     signals, filtered_by_trend, failed, momentum_sweep = [], [], [], []
 
-    # Step 1: Batch download (using robust yf.Ticker loop)
-    ticker_dfs = await asyncio.to_thread(_batch_download, tickers, interval, lookback_days)
+    # Step 1: Batch download (using concurrent yf.Ticker loop)
+    # Use _batch_download_async instead of sequential _batch_download.
+    # With YF_CONCURRENCY=5 and 50ms stagger, 307 cache-miss tickers
+    # take ~2 min instead of ~8 min sequential. Cache hits are instant.
+    ticker_dfs = await _batch_download_async(tickers, interval, lookback_days)
 
     # Step 2: Process each ticker
     for ticker in tickers:
@@ -4103,6 +4345,95 @@ async def ema9_quick_scan(ticker: str):
         result["signal_type"] = "NO_SIGNAL"
     else:
         result["signal_type"] = result.get("status", "UNKNOWN")
+
+    return _json_safe(result)
+
+
+# ─────────────────────────────────────────────────────────────
+#  SCAN ALL NSE F&O TICKERS — Full Universe Screener
+# ─────────────────────────────────────────────────────────────
+#  This endpoint loads ALL tickers from tickers-healthy-strict-4.csv
+#  (the pre-filtered list of actively-traded NSE tickers — no delisted,
+#  no suspended, no illiquid names) and runs the FULL EMA9 pipeline on
+#  every single one — no pre-filter, no Chartink clause gate.
+#
+#  Why this exists:
+#    The Chartink Live Feed only scans tickers that pass a Chartink
+#    scan clause (e.g. "close > 9 EMA"). That means stocks BELOW 9EMA
+#    that are about to cross over are NEVER caught. This endpoint
+#    processes the ENTIRE healthy universe so you catch every fresh 9EMA
+#    crossover, prime target, and momentum sweep candidate.
+#
+#  Ticker source priority:
+#    1. data/tickers-healthy-strict-4.csv (pre-filtered, no dead names)
+#    2. data/tickers.csv (F&O list, fallback)
+#
+#  Performance:
+#    • yfinance data is cached (4hr TTL) — repeat runs are instant.
+#    • FV enrichment is cached (12hr TTL).
+#    • Near-support enrichment runs on SIGNAL results only.
+#    • First run with ~307 tickers: ~2-3 min (async concurrent).
+#    • Subsequent runs: <10 seconds (all cache hits).
+# ─────────────────────────────────────────────────────────────
+
+@router.post("/api/ema9/screen-all-nse")
+async def ema9_screen_all_nse():
+    """
+    Scan the ENTIRE healthy NSE ticker universe through the full 9EMA
+    pipeline. Returns the same structure as /api/ema9/screen.
+
+    Ticker source: tickers-healthy-strict-4.csv (falls back to tickers.csv).
+
+    No input body needed — tickers loaded from local CSV.
+    """
+    # Load healthy tickers (pre-filtered, no delisted/suspended names)
+    source_df = _load_healthy_df()
+
+    if source_df.empty:
+        raise HTTPException(
+            404,
+            "No ticker CSV found. Place tickers-healthy-strict-4.csv or "
+            "tickers.csv in the data/ directory next to the server."
+        )
+
+    tickers = source_df["symbol"].dropna().str.strip().str.upper().unique().tolist()
+
+    if not tickers:
+        raise HTTPException(404, "Ticker CSV is empty — no symbols to scan.")
+
+    logger.info(f"[ScreenAllNSE] Starting full-universe scan: {len(tickers)} tickers from {HEALTHY_CSV}")
+
+    # Run the FULL pipeline — same as /api/ema9/screen but with all tickers.
+    # All config settings (uptrend, FV gap, pullback, vol target, momentum sweep)
+    # are inherited from config.json automatically (None = fall back to config).
+    result = await _run_screen_pipeline(
+        tickers=tickers,
+        interval="1d",
+        lookback_days=180,
+        max_candles_ago=10,
+        require_uptrend=None,          # inherit from config
+        prime_fv_gap_pct=None,         # inherit from config
+        pullback_lookback_days=None,   # inherit from config
+        pullback_threshold_pct=None,   # inherit from config
+        filter_pullback=None,          # inherit from config
+        vol_target_mode=None,          # inherit from config
+        vol_target_atr_period=None,    # inherit from config
+        vol_target_multiplier=None,    # inherit from config
+        vol_target_floor_pct=None,     # inherit from config
+        vol_target_cap_pct=None,       # inherit from config
+    )
+
+    # Add metadata so the frontend knows this was a full-universe scan
+    result["scan_mode"] = "all_nse"
+    result["scan_source"] = HEALTHY_CSV
+    result["total_tickers_scanned"] = len(tickers)
+    result["last_run_at"] = dt_module.datetime.now(IST if 'IST' in dir() else None).isoformat() if 'IST' in dir() else dt_module.datetime.utcnow().isoformat()
+
+    logger.info(f"[ScreenAllNSE] Complete: {len(tickers)} scanned → "
+                f"{result.get('prime_count', 0)} prime, "
+                f"{result.get('other_count', 0)} other, "
+                f"{result.get('momentum_sweep_count', 0)} momentum sweep, "
+                f"{len(result.get('failed', []))} failed")
 
     return _json_safe(result)
 

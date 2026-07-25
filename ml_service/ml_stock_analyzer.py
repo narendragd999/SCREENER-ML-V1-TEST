@@ -597,7 +597,44 @@ def suggest_strategy(
     # ══════════════════════════════════════════════════════════════
     #  GET INTELLIGENT SCORE (or fall back to ML prediction)
     # ══════════════════════════════════════════════════════════════
-    if HAS_INTELLIGENT_SCORING:
+# ══════════════════════════════════════════════════════════════
+    #  COMBINED STUDY: TF Model + Intelligent Scoring (NEW)
+    #  - TF model drives the DECISION (signal_quality, regime, expected_return)
+    #  - Intelligent scoring provides EXPLANATION (10 components)
+    # ══════════════════════════════════════════════════════════════
+
+    ml_pred = ml_prediction or {}
+
+    # Check if TF model is trained (model_status == "trained")
+    tf_model_trained = (
+        ml_pred.get("model_status") == "trained"
+        and ml_pred.get("signal_quality") is not None
+    )
+
+    if tf_model_trained:
+        # ✅ USE TF MODEL for the decision (this is what you want!)
+        ml_score = ml_pred.get("ml_score", 50)
+        signal_quality = ml_pred.get("signal_quality", 0.5)
+        regime = ml_pred.get("trend_regime", "SIDEWAYS")
+        expected_return = ml_pred.get("expected_return", 0)
+        max_drawdown = ml_pred.get("max_drawdown", 0)
+        risk_reward_base = ml_pred.get("risk_reward_ratio", 0)
+        score_components = {}
+        scoring_method = "tf_model_trained"
+
+        # Also compute intelligent scoring for EXPLANATION (not for decision)
+        if HAS_INTELLIGENT_SCORING:
+            try:
+                intel_score = compute_intelligent_score(df)
+                score_components = intel_score.get("components", {})
+                # Store for later use in reasons
+                _intel_context = intel_score
+            except Exception:
+                _intel_context = {}
+        else:
+            _intel_context = {}
+    elif HAS_INTELLIGENT_SCORING:
+        # ⚠️ FALLBACK: TF model not trained, use intelligent scoring
         intel_score = compute_intelligent_score(df)
         ml_score = intel_score.get("ml_score", 50)
         signal_quality = intel_score.get("signal_quality", 0.5)
@@ -606,8 +643,10 @@ def suggest_strategy(
         max_drawdown = intel_score.get("max_drawdown", 0)
         risk_reward_base = intel_score.get("risk_reward_ratio", 0)
         score_components = intel_score.get("components", {})
-        scoring_method = "intelligent_v2"
+        scoring_method = "intelligent_v2_fallback"
+        _intel_context = intel_score
     else:
+        # ❌ NO MODEL AVAILABLE — use whatever ml_pred has
         ml_score = ml_pred.get("ml_score", 50)
         signal_quality = ml_pred.get("signal_quality", 0.5)
         regime = ml_pred.get("trend_regime", "SIDEWAYS")
@@ -615,7 +654,8 @@ def suggest_strategy(
         max_drawdown = ml_pred.get("max_drawdown", 0)
         risk_reward_base = ml_pred.get("risk_reward_ratio", 0)
         score_components = {}
-        scoring_method = "ml_model"
+        scoring_method = "no_model"
+        _intel_context = {}
 
     # ══════════════════════════════════════════════════════════════
     #  MULTI-TIMEFRAME ALIGNMENT
@@ -762,6 +802,32 @@ def suggest_strategy(
         penalty_total += 3
         all_names = [p["name"] for p in bullish_patterns + bearish_patterns + bullish_chart + bearish_chart][:4]
         reasons.append({"text": f"Mixed signals: {', '.join(all_names)}", "sentiment": "neutral", "impact": -3})
+
+# ── TF MODEL SIGNAL (NEW — shows that trained model is driving decision) ──
+    if tf_model_trained:
+        model_version = ml_pred.get("model_version", "unknown")
+        if signal_quality > 0.6:
+            boost_total += 12
+            reasons.append({"text": f"🤖 TF Model ({model_version[:25]}): {signal_quality:.0%} confidence — HIGH quality signal", "sentiment": "positive", "impact": 12})
+        elif signal_quality > 0.45:
+            boost_total += 6
+            reasons.append({"text": f"🤖 TF Model: {signal_quality:.0%} confidence — moderate signal", "sentiment": "positive", "impact": 6})
+        elif signal_quality < 0.3:
+            penalty_total += 10
+            reasons.append({"text": f"🤖 TF Model: {signal_quality:.0%} confidence — LOW quality, avoid", "sentiment": "negative", "impact": -10})
+        else:
+            reasons.append({"text": f"🤖 TF Model: {signal_quality:.0%} confidence — neutral", "sentiment": "neutral", "impact": 0})
+
+    # ── INTELLIGENT SCORING CONTEXT (explanation only, not for decision) ──
+    if _intel_context:
+        comp = _intel_context.get("components", {})
+        if comp:
+            top_components = sorted(comp.items(), key=lambda x: x[1], reverse=True)[:3]
+            for name, score in top_components:
+                if score >= 8:
+                    reasons.append({"text": f"📊 {name.replace('_', ' ').title()}: {score}/10 — strong", "sentiment": "positive", "impact": 0})
+                elif score <= 3:
+                    reasons.append({"text": f"📊 {name.replace('_', ' ').title()}: {score}/10 — weak", "sentiment": "negative", "impact": 0})
 
     # ── ML/INTELLIGENT REGIME ──
     if regime == "UPTREND":
