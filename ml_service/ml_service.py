@@ -54,6 +54,8 @@ import math
 import logging
 import threading
 import asyncio
+import uuid
+import hashlib
 import datetime as dt
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -408,16 +410,20 @@ async def _fetch_chartink_from_main() -> List[Dict]:
 
 
 async def _fetch_ema9_signals_from_main() -> List[Dict]:
+    """Fetch EMA9 quick-scan signals from main app. Returns [] if endpoint doesn't exist (404 is expected)."""
     import httpx
     url = f"{config['main_app_url']}/api/ema9/quick-scan"
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(url)
             if resp.status_code == 200:
                 data = resp.json()
                 return data.get("prime_targets", [])
-    except Exception as e:
-        logger.warning(f"[EMA9] Failed to fetch from main app: {e}")
+            # 404 is expected — endpoint may not exist on main app
+            if resp.status_code == 404:
+                return []
+    except Exception:
+        pass
     return []
 
 
@@ -1434,9 +1440,125 @@ async def stock_deep_analysis(ticker: str):
     return report
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  ASYNC BATCH SCANNER (avoids connection timeout on Windows)
+# ═══════════════════════════════════════════════════════════════════════════
+_batch_scans: Dict[str, Dict] = {}   # scan_id -> {status, progress, result, error}
+_batch_scan_lock = threading.Lock()
+
+
+def _run_batch_scan(scan_id: str, tickers: List[str]):
+    """Run the full batch scan in a background thread. Updates _batch_scans dict."""
+    with _batch_scan_lock:
+        _batch_scans[scan_id]["status"] = "downloading"
+        _batch_scans[scan_id]["progress"] = "Downloading data for " + str(len(tickers)) + " tickers..."
+
+    try:
+        ticker_dfs = download_tickers_batch(tickers)
+        if not ticker_dfs:
+            with _batch_scan_lock:
+                _batch_scans[scan_id]["status"] = "failed"
+                _batch_scans[scan_id]["error"] = "Failed to download data for any ticker"
+            return
+
+        with _batch_scan_lock:
+            _batch_scans[scan_id]["status"] = "predicting"
+            _batch_scans[scan_id]["progress"] = f"Running ML predictions on {len(ticker_dfs)} stocks..."
+            _batch_scans[scan_id]["downloaded"] = len(ticker_dfs)
+
+        ml_predictions = model_manager.predict_batch(ticker_dfs)
+
+        if HAS_CONTINUOUS_LEARNING:
+            for ticker, pred in ml_predictions.items():
+                _log_prediction_to_db(ticker, pred, source="batch_scanner")
+
+        with _batch_scan_lock:
+            _batch_scans[scan_id]["status"] = "scoring"
+            _batch_scans[scan_id]["progress"] = "Scoring strategies..."
+
+        results = scan_stocks_for_3pct(ticker_dfs, ml_predictions)
+
+        scan_result = {
+            "total_scanned": len(tickers),
+            "data_available": len(ticker_dfs),
+            "results": results,
+            "strong_buys": len([r for r in results if r["strategy_action"] == "STRONG_BUY"]),
+            "buys": len([r for r in results if r["strategy_action"] == "BUY"]),
+            "watch": len([r for r in results if r["strategy_action"] == "WATCH"]),
+            "wait": len([r for r in results if r["strategy_action"] == "WAIT"]),
+            "scan_time": dt.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        with _batch_scan_lock:
+            _batch_scans[scan_id]["status"] = "completed"
+            _batch_scans[scan_id]["progress"] = "Done"
+            _batch_scans[scan_id]["result"] = scan_result
+
+        logger.info(f"[BatchScan] Scan {scan_id[:8]} completed: {len(results)} results ({scan_result['strong_buys']} SB, {scan_result['buys']} BUY)")
+
+    except Exception as e:
+        logger.error(f"[BatchScan] Scan {scan_id[:8]} failed: {e}")
+        with _batch_scan_lock:
+            _batch_scans[scan_id]["status"] = "failed"
+            _batch_scans[scan_id]["error"] = str(e)
+
+
 @app.post("/api/stock-analysis/batch")
-async def stock_analysis_batch(background_tasks: BackgroundTasks):
-    """Scan ALL F&O stocks with ML + pattern recognition for 3% target."""
+async def stock_analysis_batch():
+    """Start an async batch scan. Returns scan_id immediately — poll /batch-status for results."""
+    tickers = get_fno_tickers()
+    if not tickers:
+        raise HTTPException(500, "No tickers available")
+
+    scan_id = uuid.uuid4().hex[:12]
+
+    with _batch_scan_lock:
+        _batch_scans[scan_id] = {
+            "scan_id": scan_id,
+            "status": "started",
+            "progress": "Starting scan...",
+            "total_tickers": len(tickers),
+            "downloaded": 0,
+            "started_at": dt.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    # Run in background thread so the HTTP response returns instantly
+    thread = threading.Thread(target=_run_batch_scan, args=(scan_id, tickers), daemon=True)
+    thread.start()
+
+    logger.info(f"[BatchScan] Started async scan {scan_id[:8]} for {len(tickers)} tickers")
+    return {"scan_id": scan_id, "status": "started", "total_tickers": len(tickers)}
+
+
+@app.get("/api/stock-analysis/batch-status/{scan_id}")
+async def batch_scan_status(scan_id: str):
+    """Poll the status of an async batch scan."""
+    with _batch_scan_lock:
+        info = _batch_scans.get(scan_id)
+    if not info:
+        raise HTTPException(404, f"Scan {scan_id} not found")
+
+    response = {
+        "scan_id": info["scan_id"],
+        "status": info["status"],
+        "progress": info.get("progress", ""),
+        "total_tickers": info.get("total_tickers", 0),
+        "downloaded": info.get("downloaded", 0),
+        "started_at": info.get("started_at", ""),
+    }
+
+    if info["status"] == "completed" and "result" in info:
+        response["result"] = info["result"]
+    elif info["status"] == "failed":
+        response["error"] = info.get("error", "Unknown error")
+
+    return response
+
+
+# Keep the old sync endpoint as a fallback (renamed)
+@app.post("/api/stock-analysis/batch-sync")
+async def stock_analysis_batch_sync(background_tasks: BackgroundTasks):
+    """[LEGACY] Synchronous batch scan — use /batch (async) instead. This may timeout on Windows."""
     tickers = get_fno_tickers()
     if not tickers:
         raise HTTPException(500, "No tickers available")

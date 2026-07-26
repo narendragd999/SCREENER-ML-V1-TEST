@@ -87,9 +87,9 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 DATA_DIR = "data"
-FNO_CSV  = "tickers.csv"
+FNO_CSV  = "tickers-aligned-strategy-filtered.csv"
 ALL_CSV  = "tickers_all.csv"
-HEALTHY_CSV = "tickers-healthy-strict-4.csv"
+HEALTHY_CSV = "tickers-aligned-strategy-filtered.csv"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Cache persistence directory — survives server restarts.
@@ -863,6 +863,278 @@ def _compute_swing_and_structural_low(df: pd.DataFrame, current_price: float) ->
 
 
 # ─────────────────────────────────────────────────────────────
+#  250-BAR STRUCTURAL LOW DETECTION  (Duration Backtest entry-quality filter)
+# ─────────────────────────────────────────────────────────────
+#
+#  Companion to _compute_swing_and_structural_low above, but bounded to a
+#  SHORT, USER-CONFIGURABLE lookback window (default 250 bars ≈ 1 trading
+#  year on NSE). The "global" structural low (1200-bar, most-touched cluster)
+#  is great for STOP PLACEMENT on the live screener, but for backtesting
+#  ENTRY QUALITY we want a fresher, tighter floor: "the deepest swing low
+#  within the last 250 bars that's still UNBROKEN (current price ≥ that low)".
+#
+#  Why 250 bars? The user's hypothesis: a breakout whose entry is near
+#  (within a few % above) the 250-bar structural low is a high-quality
+#  setup — price is bouncing off a fresh, well-tested support floor instead
+#  of chasing an extended move. Trades that ignore this floor (entry far
+#  above the 250-bar low) tend to fail more often because there's no nearby
+#  support to absorb rejection.
+#
+#  Approach (Williams Fractal, same as the global structural low):
+#    1. Walk bars [at_idx - lookback, at_idx - 1] (exclude the breakout day
+#       itself — we don't want today's Low to count as its own structural low).
+#    2. For each bar i in that window, mark it as a swing low if
+#       Low[i] < Low[i-1] AND Low[i] < Low[i+1].
+#    3. Keep only UNBROKEN swing lows (current_price ≥ swing_low_price).
+#    4. Among unbroken swing lows, pick the DEEPEST (lowest price) — that
+#       is the 250-bar structural low.
+#    5. If no unbroken swing low exists in the window, fall back to the
+#       absolute lowest Low in the window (still a structural reference,
+#       just not a fractal pivot).
+#
+#  Returns a flat dict with all fields the frontend / engine expects:
+#    structural_low_250_price
+#    structural_low_250_date
+#    structural_low_250_days_ago
+#    structural_low_250_proximity_pct   (+ve = price above, normal)
+#    structural_low_250_lookback_bars   (echoes the window used)
+#    is_near_structural_low_250         (True if proximity ≤ threshold_pct)
+# ─────────────────────────────────────────────────────────────
+def _compute_250_bar_structural_low(
+    df: pd.DataFrame,
+    at_idx: int,
+    current_price: float,
+    lookback_bars: int = 250,
+    near_threshold_pct: float = 8.0,
+    mode: str = "nearest",
+    below_tolerance_pct: float = 1.0,
+    recency_bars: int = 90,
+    fractal_strength: int = 3,
+    prominence_lookback: int = 15,
+    min_prominence_pct: float = 3.0,
+) -> Dict:
+    """
+    Detect an UNBROKEN, genuinely-significant swing low within the last
+    `lookback_bars` bars ending at `at_idx` (exclusive of `at_idx` itself).
+
+    `fractal_strength` — a bar must be the lowest Low among this many bars
+    on EACH side to count as a swing low (default 3, vs. a plain 1-bar
+    Williams fractal). Filters out single-candle noise.
+
+    `min_prominence_pct` / `prominence_lookback` — a candidate low must
+    have a real peak at least `min_prominence_pct`% above it within the
+    prior `prominence_lookback` bars — i.e. an actual down-move happened
+    into the low. Without this, a stock chopping sideways for weeks (every
+    bar within a few % of every other bar) will have EVERY bar qualify as
+    a trivially "near" swing low, which makes the "near structural support"
+    filter meaningless — everything looks near because nothing has moved.
+    This was why CENTURYPLY (and similar range-bound names) kept returning
+    a "structural low" almost identical to entry price: the picked bar was
+    real noise inside a flat Nov-Dec consolidation, not a tested support
+    level. With prominence filtering, only genuine pullback bottoms count,
+    so the low correctly falls back to a deeper, more meaningful level
+    (e.g. the ~150-155 area visible on the chart) when the immediate range
+    has no real structure.
+
+    `mode` controls WHICH unbroken swing low is selected:
+      • "nearest" (default, RECOMMENDED) — the unbroken swing low CLOSEST
+        to current price (highest price among those <= current_price),
+        preferring one found within the last `recency_bars` bars over an
+        older one that only coincidentally matches price (e.g. a pivot
+        from before a big rally-and-round-trip back down — same price,
+        but not a level that's actually being retested). This is the
+        actual nearby support floor a breakout is bouncing off, and is the
+        correct thing to test the "near structural low" hypothesis against.
+      • "deepest" (legacy) — the LOWEST unbroken swing low in the whole
+        250-bar window, which is frequently a support level formed many
+        months earlier and can sit 15-40%+ below current price in a
+        trending stock. Combined with a tight `near_threshold_pct` (e.g.
+        5%), this mode very rarely flags anything as "near" — which is why
+        it was producing 0 trades on tickers like ABB once the filter was
+        enabled. Kept only for backward-compatibility / comparison.
+
+    `recency_bars` (nearest mode only) — the sub-window (bars back from
+    `at_idx`) searched FIRST for an unbroken low before falling back to the
+    full `lookback_bars` window. Keeps the selected "support" genuinely
+    recent instead of a stale coincidental price match.
+
+    `below_tolerance_pct` gives a small amount of slack ONLY in the final
+    "is_near" check for a marginally broken low (current price a hair below
+    the low, e.g. an intraday wick) — it does NOT let a low above current
+    price be selected as a candidate; support must be at/below price.
+
+    Returns a flat dict with the structural-low fields used by the duration
+    backtest engine + frontend. Always returns all keys (None on failure) so
+    callers can use .get() safely.
+    """
+    out: Dict = {
+        "structural_low_250_price":           None,
+        "structural_low_250_date":            None,
+        "structural_low_250_days_ago":        None,
+        "structural_low_250_proximity_pct":   None,
+        "structural_low_250_lookback_bars":   int(lookback_bars),
+        "is_near_structural_low_250":         None,
+        "structural_low_250_mode":            mode,
+    }
+
+    try:
+        if df is None or len(df) < 5 or current_price is None or current_price <= 0:
+            return out
+        if at_idx is None or at_idx < 1:
+            return out
+
+        n = len(df)
+        lows  = df["Low"].values
+        dates = df.index
+
+        # Window: [at_idx - lookback, at_idx - 1] (inclusive bounds)
+        # Exclude the breakout day itself (at_idx) — we don't want today's
+        # Low to count as its own structural low.
+        lookback = max(5, int(lookback_bars))
+        win_start = max(1, at_idx - lookback)
+        win_end   = at_idx  # exclusive
+
+        # ── Step 1: Find genuine swing lows in the window ──
+        # A plain 3-bar fractal (Low[i] < neighbor on each side) catches
+        # every tiny 1-bar wiggle — in a stock chopping sideways for weeks
+        # (e.g. a 2-month consolidation range), almost EVERY bar qualifies
+        # as "a swing low" trivially close to current price, which defeats
+        # the whole point of a "near structural support" filter (it stops
+        # meaning anything — everything looks "near" because nothing has
+        # moved). Two upgrades fix this:
+        #   1. `fractal_strength` — the bar must be the lowest point among
+        #      `fractal_strength` bars on EACH side (not just 1), so a
+        #      single noisy wick doesn't count as a turning point.
+        #   2. `min_prominence_pct` — the bar must have a genuine peak
+        #      of at least this % above it within `prominence_lookback`
+        #      bars immediately BEFORE it. This requires an actual pullback
+        #      to have happened (a real down-move into the low), filtering
+        #      out lows that are just noise inside a flat range.
+        highs = df["High"].values
+        fs = max(1, int(fractal_strength))
+        prom_lb = max(1, int(prominence_lookback))
+        swing_lows_in_window = []  # list of (idx, price, date_str)
+        for i in range(max(win_start, fs), min(win_end, n - fs)):
+            left  = lows[i - fs:i]
+            right = lows[i + 1:i + 1 + fs]
+            if len(left) < fs or len(right) < fs:
+                continue
+            if not (lows[i] < left.min() and lows[i] < right.min()):
+                continue
+            # Prominence check: was there a real peak above this low
+            # shortly before it (i.e. a genuine down-move into the low)?
+            prom_start = max(0, i - prom_lb)
+            if prom_start >= i:
+                continue
+            local_high = float(highs[prom_start:i].max())
+            sl_price = float(lows[i])
+            prom_pct = (local_high - sl_price) / sl_price * 100 if sl_price > 0 else 0
+            if prom_pct < float(min_prominence_pct):
+                continue  # too shallow — just noise inside a flat range
+            d = dates[i]
+            date_str = str(d.date()) if hasattr(d, "date") else str(d)[:10]
+            swing_lows_in_window.append((i, sl_price, date_str))
+
+        # ── Step 2: Pick an UNBROKEN swing low, per `mode` ──
+        # "Unbroken" = current_price >= swing_low_price. STRICT — the low
+        # must be AT or BELOW current price to count as support. (A prior
+        # version accidentally let a low sit slightly ABOVE current price
+        # via the wick-tolerance math — that was wrong; support can't be
+        # above the price it's supposedly supporting. below_tolerance_pct
+        # is applied later, only to the final "is_near" check, to allow a
+        # marginal undercut without disqualifying the setup entirely.)
+        unbroken = [
+            (i, p, d) for (i, p, d) in swing_lows_in_window
+            if p <= current_price
+        ]
+
+        if unbroken:
+            if mode == "nearest":
+                # Closest support BELOW current price = highest price among
+                # unbroken lows. To avoid picking a chronologically stale
+                # pivot that only coincidentally matches price (e.g. an old
+                # low from before a big rally-and-round-trip), first search
+                # a RECENT sub-window (`recency_bars`) and only fall back to
+                # the full lookback window if nothing recent qualifies.
+                recent_cutoff = at_idx - max(5, int(recency_bars))
+                recent_unbroken = [c for c in unbroken if c[0] >= recent_cutoff]
+                if recent_unbroken:
+                    chosen = max(recent_unbroken, key=lambda x: x[1])
+                    mode_used = "nearest_recent"
+                else:
+                    chosen = max(unbroken, key=lambda x: x[1])
+                    mode_used = "nearest_full_lookback"
+            else:
+                # Legacy "deepest" mode: lowest price in the window. Often
+                # far below current price — rarely "near" under a tight
+                # threshold, by design of the older approach.
+                chosen = min(unbroken, key=lambda x: x[1])
+                mode_used = "deepest"
+            struct_idx, struct_price, struct_date = chosen
+            struct_days_ago = at_idx - struct_idx
+            source = f"fractal_unbroken_{mode_used}"
+        else:
+            # ── Step 3: Fallback to absolute lowest Low in the window ──
+            # No unbroken fractal swing low — use the raw lowest Low as a
+            # structural reference. This is less clean (a single wick can
+            # define it) but still useful — and avoids returning None when
+            # the stock is in a strong downtrend with no fractal pivot.
+            fallback_lo = float(lows[win_start:win_end].min())
+            # Find the date of that lowest Low
+            fallback_idx_local = int(np.argmin(lows[win_start:win_end]))
+            fallback_idx = win_start + fallback_idx_local
+            d = dates[fallback_idx]
+            fallback_date = str(d.date()) if hasattr(d, "date") else str(d)[:10]
+
+            struct_idx = fallback_idx
+            struct_price = fallback_lo
+            struct_date = fallback_date
+            struct_days_ago = at_idx - struct_idx
+            source = "lowest_low_fallback"
+
+            # If even the lowest Low in the window is ABOVE current price
+            # (price has fallen below every low in the window — severe
+            # breakdown), the structural low is "broken" — we still report
+            # it but is_near_structural_low_250 will be False unless within
+            # `below_tolerance_pct` (a marginal undercut).
+
+        # ── Step 4: Compute proximity (% above structural low) ──
+        # Positive = price is above the structural low (normal, support intact).
+        # Negative = price is below the structural low (broken support — rare,
+        # only happens with the lowest-low fallback in a severe downtrend).
+        if struct_price and struct_price > 0:
+            prox_pct = round((current_price - struct_price) / struct_price * 100, 2)
+        else:
+            prox_pct = None
+
+        # "Near" = proximity <= threshold % above the structural low
+        # (i.e., entry is within `near_threshold_pct` of the floor — a
+        # tight, fresh setup). A small negative slack (`below_tolerance_pct`)
+        # is allowed so a fractional wick-undercut of the low doesn't
+        # disqualify an otherwise-valid setup. Beyond that slack, or with
+        # no data, it's never "near".
+        is_near = (
+            prox_pct is not None
+            and -float(below_tolerance_pct) <= prox_pct <= float(near_threshold_pct)
+        )
+
+        out["structural_low_250_price"]           = round(struct_price, 2)
+        out["structural_low_250_date"]             = struct_date
+        out["structural_low_250_days_ago"]         = int(struct_days_ago)
+        out["structural_low_250_proximity_pct"]    = prox_pct
+        out["structural_low_250_lookback_bars"]    = int(lookback)
+        out["is_near_structural_low_250"]          = bool(is_near)
+        out["structural_low_250_source"]           = source  # metadata: how the low was derived
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        # Return the default (all-None) dict on any error — graceful degradation
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────
 #  TREND DETECTION
 # ─────────────────────────────────────────────────────────────
 def _compute_trend(df: pd.DataFrame) -> Dict:
@@ -1574,6 +1846,22 @@ def _duration_backtest_ticker(
     vol_target_multiplier:  float = 1.5,       # target = multiplier × ATR / price × 100
     vol_target_floor_pct:   float = 2.0,       # min target % regardless of ATR
     vol_target_cap_pct:     float = 8.0,       # max target % regardless of ATR
+    # ── 250-Bar Structural Low (entry-quality filter) ──────────────────────
+    # For each trade, computes the deepest UNBROKEN Williams-Fractal swing low
+    # in the last `structural_lookback_bars` bars (default 250 ≈ 1 trading
+    # year on NSE) ENDING at the breakout bar (exclusive). The trade is
+    # flagged `is_near_structural_low_250=True` when entry is within
+    # `structural_threshold_pct` % above that low. The route-level filter
+    # `filter_near_structural` decides whether non-near trades are dropped
+    # from the primary set.
+    structural_lookback_bars: int   = 250,     # window for the structural-low scan
+    structural_threshold_pct: float = 8.0,     # "near structural low" = within this % above the low (was 5.0 — too tight, produced 0 trades on many tickers)
+    structural_low_mode:      str   = "nearest",  # "nearest" (recommended) = closest unbroken support below price; "deepest" (legacy) = lowest low in whole window, rarely near price
+    structural_below_tolerance_pct: float = 1.0,  # slack for a marginal wick-undercut of the low
+    structural_recency_bars:  int   = 90,      # nearest mode: prefer a recent unbroken low over a stale coincidental price match
+    structural_fractal_strength:    int   = 3,     # bars on each side a low must beat to count as a swing low (filters 1-bar noise)
+    structural_prominence_lookback: int   = 15,    # bars searched before a candidate low for a qualifying peak
+    structural_min_prominence_pct:  float = 3.0,   # candidate low must have a peak >= this % above it — filters trivial in-range wiggles
 ) -> Dict:
     """
     Walk-forward backtest for the 9EMA breakout strategy, filtered to a
@@ -1888,6 +2176,38 @@ def _duration_backtest_ticker(
                     pullback_dist_pct = round(raw_pullback, 2)
                     is_pullback = raw_pullback >= float(pullback_threshold_pct)
 
+        # ── Compute 250-bar Structural Low (entry-quality filter) ──────────────
+        # The deepest UNBROKEN Williams-Fractal swing low within the last
+        # `structural_lookback_bars` bars (default 250 ≈ 1 trading year on
+        # NSE), ending at the breakout bar (exclusive). A trade is
+        # `is_near_structural_low_250=True` when the entry price is within
+        # `structural_threshold_pct` % above this structural low — i.e., the
+        # breakout is bouncing off a fresh, well-tested support floor instead
+        # of chasing an extended move far above any recent low.
+        #
+        # Hypothesis (user-specified): trades near the 250-bar structural
+        # low should outperform trades far above it — the nearby floor
+        # absorbs rejection and offers a tight invalidation level.
+        #
+        # We compute this on EVERY trade (cheap, and the user wants to see
+        # the structural-low fields on every row in the trades table). The
+        # route-level `filter_near_structural` flag (handled in the route,
+        # not here) decides whether non-near trades are dropped from the
+        # primary set.
+        struct250_data = _compute_250_bar_structural_low(
+            df,
+            at_idx              = i,
+            current_price       = curr_close,
+            lookback_bars       = structural_lookback_bars,
+            near_threshold_pct  = structural_threshold_pct,
+            mode                = structural_low_mode,
+            below_tolerance_pct = structural_below_tolerance_pct,
+            recency_bars        = structural_recency_bars,
+            fractal_strength    = structural_fractal_strength,
+            prominence_lookback = structural_prominence_lookback,
+            min_prominence_pct  = structural_min_prominence_pct,
+        )
+
         # ── Compute target_price: fixed vs volatility-adjusted (ATR) ──────────
         # vol_target_mode="fixed" → use the user's target_pct as-is (legacy behavior).
         # vol_target_mode="atr"   → compute target_pct for THIS trade based on ATR:
@@ -1951,6 +2271,18 @@ def _duration_backtest_ticker(
             "prior_high":           prior_high,               # N-day high before breakout, or None
             "pullback_dist_pct":    pullback_dist_pct,        # % pullback from prior high (≥0 if pulled back, ≤0 if extended)
             "is_pullback":          is_pullback,              # True if pullback_dist_pct >= threshold
+            # 250-bar Structural Low fields (entry-quality — user's new feature):
+            # The deepest UNBROKEN swing low in the last `structural_lookback_bars`
+            # bars. `is_near_structural_low_250=True` when entry is within
+            # `structural_threshold_pct` % above this low — a high-quality setup
+            # bouncing off a fresh support floor.
+            "structural_low_250_price":          struct250_data.get("structural_low_250_price"),
+            "structural_low_250_date":           struct250_data.get("structural_low_250_date"),
+            "structural_low_250_days_ago":       struct250_data.get("structural_low_250_days_ago"),
+            "structural_low_250_proximity_pct":  struct250_data.get("structural_low_250_proximity_pct"),
+            "structural_low_250_lookback_bars":  struct250_data.get("structural_low_250_lookback_bars"),
+            "structural_low_250_source":         struct250_data.get("structural_low_250_source"),
+            "is_near_structural_low_250":        struct250_data.get("is_near_structural_low_250"),
             # Exit fields filled when trade closes:
             "exit_date":     None,
             "exit_price":    None,
@@ -2317,6 +2649,30 @@ class Ema9DurationBacktestRequest(BaseModel):
     vol_target_multiplier:  float = 1.5       # target = multiplier × ATR/price × 100
     vol_target_floor_pct:   float = 2.0       # min target % (prevents 0.5% targets on tiny-ATR stocks)
     vol_target_cap_pct:     float = 8.0       # max target % (prevents 25% targets on huge-ATR stocks)
+    # ── 250-Bar Structural Low (entry-quality filter) ──────────────────────
+    # Computes the deepest UNBROKEN Williams-Fractal swing low within the last
+    # `structural_lookback_bars` bars (default 250 ≈ 1 trading year on NSE).
+    # A trade is flagged `is_near_structural_low_250=True` when its entry
+    # price is within `structural_threshold_pct` % above that structural low
+    # — i.e., the breakout is bouncing off a fresh, well-tested support floor
+    # instead of chasing an extended move.
+    #
+    # When `filter_near_structural=True`, trades that DON'T meet the
+    # near-structural criterion are excluded from the primary trade set +
+    # aggregate stats (mirror of the pullback filter pattern).
+    #
+    # Hypothesis (user-specified): trades near the 250-bar structural low
+    # should outperform trades far above it, because the nearby floor
+    # absorbs rejection and offers a tight invalidation level.
+    structural_lookback_bars: int   = 250     # window for the structural-low scan (default 250 ≈ 1 trading year)
+    structural_threshold_pct: float = 8.0     # "near structural low" = within this % above the low (was 5.0 — too tight, gave 0 trades on many tickers)
+    filter_near_structural:   bool  = False   # if True, drop trades that aren't near the 250-bar structural low
+    structural_low_mode:      str   = "nearest"  # "nearest" (recommended) = closest unbroken support below price; "deepest" (legacy) = lowest low in whole window
+    structural_below_tolerance_pct: float = 1.0  # slack % for a marginal wick-undercut of the low
+    structural_recency_bars:  int   = 90      # nearest mode: prefer a recent unbroken low over a stale coincidental price match
+    structural_fractal_strength:    int   = 3     # bars on each side a low must beat to count as a swing low (filters 1-bar noise)
+    structural_prominence_lookback: int   = 15    # bars searched before a candidate low for a qualifying peak
+    structural_min_prominence_pct:  float = 3.0   # candidate low must have a peak >= this % above it — filters trivial in-range wiggles (e.g. CENTURYPLY's flat Nov-Dec chop)
 
 
 @router.post("/api/ema9/duration-backtest")
@@ -2392,6 +2748,14 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
                 vol_target_multiplier     = req.vol_target_multiplier,
                 vol_target_floor_pct      = req.vol_target_floor_pct,
                 vol_target_cap_pct        = req.vol_target_cap_pct,
+                structural_lookback_bars  = req.structural_lookback_bars,
+                structural_threshold_pct  = req.structural_threshold_pct,
+                structural_low_mode       = req.structural_low_mode,
+                structural_below_tolerance_pct = req.structural_below_tolerance_pct,
+                structural_recency_bars   = req.structural_recency_bars,
+                structural_fractal_strength    = req.structural_fractal_strength,
+                structural_prominence_lookback = req.structural_prominence_lookback,
+                structural_min_prominence_pct  = req.structural_min_prominence_pct,
             )
             if bt["status"] == "NO_DATA":
                 failed.append({"ticker": ticker, "error": bt.get("error", "NO_DATA")})
@@ -2573,6 +2937,40 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
                     f"excluded {len(non_pullback_trades)} non-pullback trades "
                     f"(threshold={req.pullback_threshold_pct}%, lookback={req.pullback_lookback_days}d)")
 
+    # ── 250-bar Structural Low filter: keep only trades NEAR the structural low ─
+    # "Near structural low" = entry price is within `structural_threshold_pct` %
+    # ABOVE the deepest unbroken swing low in the last `structural_lookback_bars`
+    # bars. These are fresh breakouts bouncing off a well-tested support floor —
+    # they should outperform extended breakouts (entry far above any recent low)
+    # because the nearby floor absorbs rejection and offers a tight invalidation.
+    #
+    # Mirror the pullback filter pattern: partition into near vs away sets,
+    # drive primary_trades from the near set when the filter is enabled, and
+    # emit a side-by-side aggregate for A/B comparison.
+    near_structural_trades    = [t for t in primary_trades if t.get("is_near_structural_low_250") is True]
+    away_structural_trades    = [t for t in primary_trades if t.get("is_near_structural_low_250") is False]
+    no_structural_data_trades = [t for t in primary_trades if t.get("is_near_structural_low_250") is None]
+
+    if req.filter_near_structural:
+        for bt_result in results:
+            bt_result["trades_before_structural_filter"] = len(bt_result["trades"])
+            # Keep only trades flagged as near-structural. Trades with no
+            # structural data (None) are dropped — the user asked for a
+            # strict "only generate trade near structural bar 250 bars"
+            # mode, so we exclude ambiguous cases.
+            bt_result["trades"] = [t for t in bt_result["trades"] if t.get("is_near_structural_low_250") is True]
+            bt_result["summary"] = _recompute_summary(bt_result["trades"], req.target_pct)
+        primary_trades = near_structural_trades
+        # Re-sync all_trades so the trades table + equity curve + monthly
+        # breakdown all reflect the structural-filtered set.
+        all_trades = []
+        for bt_result in results:
+            all_trades.extend(bt_result["trades"])
+        logger.info(f"[Duration-BT] filter_near_structural=True → "
+                    f"kept {len(near_structural_trades)} near-structural trades, "
+                    f"excluded {len(away_structural_trades)} away + {len(no_structural_data_trades)} no-data "
+                    f"(threshold={req.structural_threshold_pct}%, lookback={req.structural_lookback_bars} bars)")
+
     # Sort by win_rate desc, then total_return desc
     results.sort(
         key=lambda r: (
@@ -2689,6 +3087,15 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
     pb_agg     = _compute_subset_aggregate(pullback_trades)
     non_pb_agg = _compute_subset_aggregate(non_pullback_trades)
 
+    # ── 250-bar Structural Low aggregate — near vs away from structural floor ─
+    # Shows whether breakouts NEAR the 250-bar structural low (deepest unbroken
+    # swing low in the last `structural_lookback_bars` bars) outperform
+    # breakouts FAR above it. Always computed (the structural-low fields are
+    # computed on every trade) — the user toggles `filter_near_structural` to
+    # actually drop non-near trades from the primary set.
+    near_struct_agg = _compute_subset_aggregate(near_structural_trades)
+    away_struct_agg = _compute_subset_aggregate(away_structural_trades)
+
     # ── Volatility-Adjusted Target aggregate — ATR-target vs fixed-target ────
     # When vol_target_mode="atr", the effective_target_pct varies per trade
     # (high-vol stocks get larger targets, low-vol stocks get smaller targets).
@@ -2728,6 +3135,9 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
         f"AwayRes={len(away_resistance_trades)} (WR={away_res_agg.get('win_rate_pct')}%) | "
         f"Pullback={len(pullback_trades)} (WR={pb_agg.get('win_rate_pct')}%) "
         f"NonPullback={len(non_pullback_trades)} (WR={non_pb_agg.get('win_rate_pct')}%) | "
+        f"NearStruct={len(near_structural_trades)} (WR={near_struct_agg.get('win_rate_pct')}%) "
+        f"AwayStruct={len(away_structural_trades)} (WR={away_struct_agg.get('win_rate_pct')}%) "
+        f"[lookback={req.structural_lookback_bars}b thr={req.structural_threshold_pct}%] | "
         f"target_mode={req.vol_target_mode} "
         f"HighVol={len(high_vol_trades)} (WR={high_vol_agg.get('win_rate_pct')}%) "
         f"LowVol={len(low_vol_trades)} (WR={low_vol_agg.get('win_rate_pct')}%)"
@@ -2772,6 +3182,29 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
             "pullback_threshold_pct": req.pullback_threshold_pct,
             "pullback_lookback_days": req.pullback_lookback_days,
         },
+        "structural_aggregate": {
+            # A/B split by proximity to the 250-bar structural low. "Near" =
+            # entry within `structural_threshold_pct` % above the deepest
+            # unbroken swing low in the last `structural_lookback_bars` bars.
+            # "Away" = entry far above any recent structural floor (extended).
+            # Hypothesis (user-specified): near-structural trades should
+            # outperform because the nearby floor absorbs rejection and
+            # offers a tight invalidation level.
+            "near_structural":  near_struct_agg,    # stats for trades near the 250-bar structural low
+            "away_structural":  away_struct_agg,    # stats for trades far above the structural low (extended)
+            "near_structural_count":     len(near_structural_trades),
+            "away_structural_count":     len(away_structural_trades),
+            "no_structural_data_count":  len(no_structural_data_trades),
+            "structural_lookback_bars":  req.structural_lookback_bars,
+            "structural_threshold_pct":  req.structural_threshold_pct,
+            "filter_near_structural":    req.filter_near_structural,
+            "structural_low_mode":       req.structural_low_mode,
+            "structural_below_tolerance_pct": req.structural_below_tolerance_pct,
+            "structural_recency_bars":   req.structural_recency_bars,
+            "structural_fractal_strength": req.structural_fractal_strength,
+            "structural_prominence_lookback": req.structural_prominence_lookback,
+            "structural_min_prominence_pct":  req.structural_min_prominence_pct,
+        },
         "vol_target_aggregate": {
             # A/B split by volatility (median ATR% at entry). Shows whether
             # the strategy performs better on high-vol or low-vol stocks,
@@ -2812,6 +3245,15 @@ async def ema9_duration_backtest(req: Ema9DurationBacktestRequest):
             "pullback_lookback_days":    req.pullback_lookback_days,
             "pullback_threshold_pct":    req.pullback_threshold_pct,
             "filter_pullback":           req.filter_pullback,
+            "structural_lookback_bars":  req.structural_lookback_bars,
+            "structural_threshold_pct":  req.structural_threshold_pct,
+            "filter_near_structural":    req.filter_near_structural,
+            "structural_low_mode":       req.structural_low_mode,
+            "structural_below_tolerance_pct": req.structural_below_tolerance_pct,
+            "structural_recency_bars":   req.structural_recency_bars,
+            "structural_fractal_strength": req.structural_fractal_strength,
+            "structural_prominence_lookback": req.structural_prominence_lookback,
+            "structural_min_prominence_pct":  req.structural_min_prominence_pct,
             "vol_target_mode":           req.vol_target_mode,
             "vol_target_atr_period":     req.vol_target_atr_period,
             "vol_target_multiplier":     req.vol_target_multiplier,

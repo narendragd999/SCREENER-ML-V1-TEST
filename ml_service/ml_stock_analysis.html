@@ -91,8 +91,8 @@ select { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.o
     class="px-5 py-2 bg-accent/20 text-accent border border-accent/30 rounded-lg text-sm font-bold hover:bg-accent/30 transition">
     Scan All F&O Stocks
   </button>
-  <button onclick="scanAllStocks()" id="btn-scan-loading" class="hidden px-5 py-2 bg-accent/10 text-accent/50 rounded-lg text-sm font-bold cursor-wait">
-    <span class="spinner inline-block w-4 h-4 mr-2 align-middle" style="border-width:2px"></span>Scanning...
+  <button id="btn-scan-loading" class="hidden px-5 py-2 bg-accent/10 text-accent/50 rounded-lg text-sm font-bold cursor-wait" disabled>
+    <span class="spinner inline-block w-4 h-4 mr-2 align-middle" style="border-width:2px"></span><span id="scan-progress-text">Scanning...</span>
   </button>
 </div>
 
@@ -530,6 +530,16 @@ select { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.o
             <tr><td colspan="17" class="px-3 py-12 text-center text-gray-500">Click "Scan All F&O Stocks" to run the ML scanner</td></tr>
           </tbody>
         </table>
+      </div>
+    </div>
+    <!-- Scan progress bar -->
+    <div id="scan-progress-bar" class="hidden mt-4 bg-card rounded-xl border border-border p-4">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs text-gray-400" id="scan-progress-label">Starting scan...</span>
+        <span class="text-xs font-mono text-accent" id="scan-progress-pct">0%</span>
+      </div>
+      <div class="w-full bg-card2 rounded-full h-2 overflow-hidden">
+        <div id="scan-progress-fill" class="h-full bg-accent/70 rounded-full transition-all duration-500" style="width: 0%"></div>
       </div>
     </div>
     <div class="text-center mt-3">
@@ -1043,25 +1053,166 @@ function renderReport(r) {
 }
 
 // ????????? SCAN ALL STOCKS ?????????
-async function scanAllStocks() {
-  document.getElementById('btn-scan').classList.add('hidden');
-  document.getElementById('btn-scan-loading').classList.remove('hidden');
-  switchTab('scanner');
-
+async function loadQuickResults() {
+  /* Auto-load chartink decisions (already processed by background ingest) into the scanner table.
+     This gives INSTANT results without waiting for the full batch scan. */
   try {
-    const data = await api('/api/stock-analysis/batch', { method: 'POST' });
-    scanResults = data.results || [];
+    const data = await api('/api/decisions?limit=50');
+    const decisions = data.decisions || [];
+    if (!decisions.length) return;
 
-    document.getElementById('scan-sb').textContent = data.strong_buys;
-    document.getElementById('scan-buy').textContent = data.buys;
-    document.getElementById('scan-watch').textContent = data.watch;
-    document.getElementById('scan-wait').textContent = data.wait;
+    // Map decision format -> scanner table format
+    scanResults = decisions.map(d => ({
+      ticker: d.ticker,
+      current_price: d.entry_price || 0,
+      strategy_action: d.action,          // STRONG_BUY / BUY / HOLD / SKIP
+      confidence: d.confidence || 0,
+      risk_reward: d.risk_reward_ratio || 0,
+      signal_quality: d.signal_quality || 0,
+      trend_regime: d.trend_regime || 'N/A',
+      expected_return: d.expected_return_pct || 0,
+      max_drawdown: d.max_drawdown_pct || 0,
+      hit_rate_3pct: '--',
+      behavior_type: '--',
+      volatility_regime: '--',
+      target_price: d.target_price || 0,
+      stop_loss: 0,
+      entry_price: d.entry_price || 0,
+      position_size: d.suggested_position_size || '--',
+      reasons: d.reasons || [],
+      reasons_tagged: (d.reasons || []).map(r => ({
+        text: r,
+        sentiment: r.includes('WARNING') || r.includes('skip') || r.includes('High expected drawdown') ? 'negative'
+               : r.includes('Undervalued') || r.includes('support') || r.includes('Pullback') || r.includes('signal quality') ? 'positive'
+               : 'neutral',
+        impact: 0
+      })),
+      volume_ratio: 0,
+      rsi_value: 0,
+      multi_timeframe: {},
+      momentum: {},
+      scoring_method: 'chartink_ingest',
+    }));
+
+    const sb = scanResults.filter(r => r.strategy_action === 'STRONG_BUY').length;
+    const buy = scanResults.filter(r => r.strategy_action === 'BUY').length;
+    const watch = scanResults.filter(r => r.strategy_action === 'HOLD').length;
+    const wait = scanResults.filter(r => r.strategy_action === 'SKIP').length;
+    document.getElementById('scan-sb').textContent = sb;
+    document.getElementById('scan-buy').textContent = buy;
+    document.getElementById('scan-watch').textContent = watch;
+    document.getElementById('scan-wait').textContent = wait;
     document.getElementById('scan-footer').textContent =
-      `Scanned ${data.total_scanned} tickers | Data available: ${data.data_available} | ${data.scan_time}`;
+      `Quick results: ${data.total_stored} decisions from Chartink ingest | Click "Scan All" for full ML deep scan`;
 
     renderScanTable();
   } catch (e) {
+    console.warn('Quick results load failed:', e);
+  }
+}
+
+let _scanPollTimer = null;
+let _scanAbort = null;
+
+async function scanAllStocks() {
+  // Cancel any previous scan poll
+  if (_scanPollTimer) { clearInterval(_scanPollTimer); _scanPollTimer = null; }
+
+  // Show loading state EVERYWHERE so user can't miss it
+  document.getElementById('btn-scan').classList.add('hidden');
+  document.getElementById('btn-scan-loading').classList.remove('hidden');
+  document.getElementById('scan-progress-bar').classList.remove('hidden');
+  document.getElementById('scan-tbody').innerHTML =
+    '<tr><td colspan="17" class="px-3 py-8 text-center"><span class="spinner inline-block w-5 h-5 mr-3 align-middle" style="border-width:3px"></span><span class="text-accent font-semibold">Starting full ML scan...</span></td></tr>';
+  document.getElementById('scan-progress-label').textContent = 'Starting scan...';
+  document.getElementById('scan-progress-pct').textContent = '0%';
+  document.getElementById('scan-progress-fill').style.width = '0%';
+  document.getElementById('scan-progress-text').textContent = 'Starting...';
+  switchTab('scanner');
+
+  try {
+    // Step 1: Start scan (returns instantly)
+    const startResp = await api('/api/stock-analysis/batch', { method: 'POST' });
+    const scanId = startResp.scan_id;
+    const totalTickers = startResp.total_tickers || '?';
+
+    document.getElementById('scan-tbody').innerHTML =
+      '<tr><td colspan="17" class="px-3 py-8 text-center"><span class="spinner inline-block w-5 h-5 mr-3 align-middle" style="border-width:3px"></span><span class="text-accent">Downloading data for ' + totalTickers + ' tickers via yfinance... (this takes 1-3 min)</span></td></tr>';
+    document.getElementById('scan-progress-label').textContent = 'Downloading data...';
+    document.getElementById('scan-progress-pct').textContent = '10%';
+    document.getElementById('scan-progress-fill').style.width = '10%';
+
+    // Step 2: Poll for results every 3 seconds
+    return new Promise((resolve, reject) => {
+      _scanPollTimer = setInterval(async () => {
+        try {
+          const status = await api(`/api/stock-analysis/batch-status/${scanId}`);
+
+          // Update progress bar + table message
+          let pct = 0;
+          let label = status.progress || 'Processing...';
+          let tableMsg = '';
+          if (status.status === 'downloading') {
+            pct = 30;
+            label = `Downloading data... (${status.downloaded || 0}/${status.total_tickers} tickers)`;
+            tableMsg = '<tr><td colspan="17" class="px-3 py-8 text-center"><span class="spinner inline-block w-5 h-5 mr-3 align-middle" style="border-width:3px"></span><span class="text-warn">Downloading data... ' + (status.downloaded || 0) + '/' + status.total_tickers + ' tickers done</span><br><span class="text-xs text-gray-500 mt-1 inline-block">This is the slow part (yfinance) — please wait...</span></td></tr>';
+          } else if (status.status === 'predicting') {
+            pct = 70;
+            label = `Running ML on ${status.downloaded} stocks...`;
+            tableMsg = '<tr><td colspan="17" class="px-3 py-8 text-center"><span class="spinner inline-block w-5 h-5 mr-3 align-middle" style="border-width:3px"></span><span class="text-ml">Running TensorFlow predictions on ' + status.downloaded + ' stocks...</span></td></tr>';
+          } else if (status.status === 'scoring') {
+            pct = 90;
+            label = 'Scoring strategies...';
+            tableMsg = '<tr><td colspan="17" class="px-3 py-8 text-center"><span class="spinner inline-block w-5 h-5 mr-3 align-middle" style="border-width:3px"></span><span class="text-accent">Scoring strategies & generating recommendations...</span></td></tr>';
+          } else if (status.status === 'completed') {
+            pct = 100;
+            label = 'Done!';
+          }
+
+          // Update all UI elements
+          document.getElementById('scan-progress-label').textContent = label;
+          document.getElementById('scan-progress-pct').textContent = pct + '%';
+          document.getElementById('scan-progress-fill').style.width = pct + '%';
+          document.getElementById('scan-progress-text').textContent = label;
+          if (tableMsg) document.getElementById('scan-tbody').innerHTML = tableMsg;
+
+          if (status.status === 'completed' && status.result) {
+            clearInterval(_scanPollTimer);
+            _scanPollTimer = null;
+            const data = status.result;
+            scanResults = data.results || [];
+
+            document.getElementById('scan-sb').textContent = data.strong_buys;
+            document.getElementById('scan-buy').textContent = data.buys;
+            document.getElementById('scan-watch').textContent = data.watch;
+            document.getElementById('scan-wait').textContent = data.wait;
+            document.getElementById('scan-footer').textContent =
+              `Scanned ${data.total_scanned} tickers | Data available: ${data.data_available} | ${data.scan_time}`;
+
+            renderScanTable();
+            setTimeout(() => {
+              document.getElementById('scan-progress-bar').classList.add('hidden');
+            }, 2000);
+            resolve();
+
+          } else if (status.status === 'failed') {
+            clearInterval(_scanPollTimer);
+            _scanPollTimer = null;
+            document.getElementById('scan-tbody').innerHTML =
+              '<tr><td colspan="17" class="px-3 py-8 text-center text-danger">Scan failed: ' + (status.error || 'Unknown error') + '</td></tr>';
+            reject(new Error(status.error || 'Scan failed on server'));
+          }
+        } catch (pollErr) {
+          console.warn('Poll error:', pollErr);
+        }
+      }, 3000);
+    });
+
+  } catch (e) {
+    document.getElementById('scan-tbody').innerHTML =
+      '<tr><td colspan="17" class="px-3 py-8 text-center text-danger">Scan error: ' + (e.message || 'Unknown') + '</td></tr>';
     alert('Scan failed: ' + (e.message || 'Unknown error'));
+    console.error('Batch scan error:', e);
   } finally {
     document.getElementById('btn-scan').classList.remove('hidden');
     document.getElementById('btn-scan-loading').classList.add('hidden');
@@ -1094,24 +1245,28 @@ function renderScanTable() {
       reasonColor = topReason.includes('WARNING') ? 'text-danger' : 'text-bull';
     }
     const sigQ = (r.signal_quality || 0) * 100;
-    const rsiVal = r.rsi_value || 50;
-    const volR = r.volume_ratio || 1;
+    const rsiVal = typeof r.rsi_value === 'number' ? r.rsi_value : 0;
+    const volR = typeof r.volume_ratio === 'number' ? r.volume_ratio : 0;
+    const fmtPrice = (v) => (v && typeof v === 'number' && v > 0) ? 'Rs.' + v.toLocaleString() : '--';
+    const fmtPct = (v) => (typeof v === 'number' && v > 0) ? v.toFixed(1) + '%' : '--';
+    const action = r.strategy_action || 'WAIT';
+    const actionBadge = action === 'HOLD' ? 'watch' : action === 'SKIP' ? 'wait' : action.toLowerCase();
     return `<tr class="border-b border-border/50 hover:bg-card2/50 transition cursor-pointer" onclick="analyzeFromScan('${r.ticker}')">
-      <td class="px-3 py-2"><span class="badge badge-${r.strategy_action.toLowerCase()}">${r.strategy_action.replace('_', ' ')}</span></td>
+      <td class="px-3 py-2"><span class="badge badge-${actionBadge}">${action.replace('_', ' ')}</span></td>
       <td class="px-3 py-2 font-mono font-bold">${r.ticker}</td>
-      <td class="px-3 py-2 text-right font-mono">Rs.${r.current_price?.toLocaleString() || '--'}</td>
-      <td class="px-3 py-2 text-right font-mono ${r.confidence >= 65 ? 'text-bull' : r.confidence >= 45 ? 'text-warn' : 'text-gray-400'}">${r.confidence}%</td>
-      <td class="px-3 py-2 text-right font-mono ${sigQ >= 60 ? 'text-bull' : sigQ >= 40 ? 'text-warn' : 'text-danger'}">${sigQ.toFixed(0)}%</td>
-      <td class="px-3 py-2 text-right font-mono">${r.risk_reward}x</td>
-      <td class="px-3 py-2 text-right font-mono ${r.hit_rate_3pct >= 40 ? 'text-bull' : r.hit_rate_3pct >= 25 ? 'text-warn' : 'text-danger'}">${r.hit_rate_3pct}%</td>
-      <td class="px-3 py-2"><span class="${r.trend_regime === 'UPTREND' ? 'text-bull' : r.trend_regime === 'DOWNTREND' ? 'text-bear' : 'text-warn'}">${r.trend_regime}</span></td>
+      <td class="px-3 py-2 text-right font-mono">${fmtPrice(r.current_price)}</td>
+      <td class="px-3 py-2 text-right font-mono ${r.confidence >= 65 ? 'text-bull' : r.confidence >= 45 ? 'text-warn' : 'text-gray-400'}">${typeof r.confidence === 'number' ? r.confidence.toFixed(1) + '%' : '--'}</td>
+      <td class="px-3 py-2 text-right font-mono ${sigQ >= 60 ? 'text-bull' : sigQ >= 40 ? 'text-warn' : 'text-danger'}">${sigQ > 0 ? sigQ.toFixed(0) + '%' : '--'}</td>
+      <td class="px-3 py-2 text-right font-mono">${typeof r.risk_reward === 'number' && r.risk_reward > 0 ? r.risk_reward + 'x' : '--'}</td>
+      <td class="px-3 py-2 text-right font-mono ${typeof r.hit_rate_3pct === 'number' ? (r.hit_rate_3pct >= 40 ? 'text-bull' : r.hit_rate_3pct >= 25 ? 'text-warn' : 'text-danger') : ''}">${fmtPct(r.hit_rate_3pct)}</td>
+      <td class="px-3 py-2"><span class="${r.trend_regime === 'UPTREND' ? 'text-bull' : r.trend_regime === 'DOWNTREND' ? 'text-bear' : 'text-warn'}">${r.trend_regime || '--'}</span></td>
       <td class="px-3 py-2 text-xs text-gray-400">${r.behavior_type || '--'}</td>
-      <td class="px-3 py-2 text-right font-mono ${r.expected_return >= 0 ? 'text-bull' : 'text-bear'}">${r.expected_return >= 0 ? '+' : ''}${r.expected_return}%</td>
-      <td class="px-3 py-2 text-right font-mono ${rsiVal >= 70 ? 'text-danger' : rsiVal <= 30 ? 'text-bull' : 'text-gray-400'}">${rsiVal.toFixed(0)}</td>
-      <td class="px-3 py-2 text-right font-mono ${volR >= 1.5 ? 'text-bull' : volR < 0.5 ? 'text-danger' : 'text-gray-400'}">${volR}x</td>
-      <td class="px-3 py-2 text-xs font-mono">Rs.${r.entry_price?.toLocaleString() || '--'}</td>
-      <td class="px-3 py-2 text-xs font-mono">Rs.${r.target_price?.toLocaleString() || '--'}</td>
-      <td class="px-3 py-2 text-xs font-mono">Rs.${r.stop_loss?.toLocaleString() || '--'}</td>
+      <td class="px-3 py-2 text-right font-mono ${typeof r.expected_return === 'number' ? (r.expected_return >= 0 ? 'text-bull' : 'text-bear') : ''}">${typeof r.expected_return === 'number' ? (r.expected_return >= 0 ? '+' : '') + r.expected_return + '%' : '--'}</td>
+      <td class="px-3 py-2 text-right font-mono ${rsiVal >= 70 ? 'text-danger' : rsiVal > 0 && rsiVal <= 30 ? 'text-bull' : 'text-gray-400'}">${rsiVal > 0 ? rsiVal.toFixed(0) : '--'}</td>
+      <td class="px-3 py-2 text-right font-mono ${volR >= 1.5 ? 'text-bull' : volR > 0 && volR < 0.5 ? 'text-danger' : 'text-gray-400'}">${volR > 0 ? volR + 'x' : '--'}</td>
+      <td class="px-3 py-2 text-xs font-mono">${fmtPrice(r.entry_price)}</td>
+      <td class="px-3 py-2 text-xs font-mono">${fmtPrice(r.target_price)}</td>
+      <td class="px-3 py-2 text-xs font-mono">${fmtPrice(r.stop_loss)}</td>
       <td class="px-3 py-2 text-xs text-gray-400">${r.position_size || '--'}</td>
       <td class="px-3 py-2 text-xs ${reasonColor} max-w-[180px] truncate" title="${(r.reasons || []).join('\n')}">${topReason}</td>
     </tr>`;
@@ -1139,6 +1294,10 @@ function switchTab(tab) {
       document.getElementById(`tab-${t}`).classList.remove('text-gray-500');
     }
   });
+  // Auto-load ingested decisions when opening scanner tab
+  if (tab === 'scanner' && scanResults.length === 0) {
+    loadQuickResults();
+  }
 }
 
 

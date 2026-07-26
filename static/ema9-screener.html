@@ -2886,6 +2886,26 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
           class="w-full px-3 py-2 rounded-lg bg-card2 border border-border/50 font-mono text-sm text-white
                  focus:outline-none focus:border-accent/50 transition-all">
       </div>
+      <!-- ── 250-Bar Structural Low inputs (entry-quality filter) ─────────── -->
+      <!-- Computes the deepest UNBROKEN Williams-Fractal swing low within the
+           last N bars (default 250 ≈ 1 trading year on NSE). A trade is
+           flagged "near structural low" when its entry is within X% above
+           that low — i.e., the breakout is bouncing off a fresh, well-tested
+           support floor instead of chasing an extended move. The toggle
+           below (Filter Non-Near-Structural) drops trades that don't meet
+           this criterion. -->
+      <div>
+        <label class="block font-ui text-xs font-600 text-slate-400 uppercase tracking-wider mb-1.5" title="Number of bars to look back for the structural-low scan. Default 250 ≈ 1 trading year on NSE. The function finds the deepest UNBROKEN Williams-Fractal swing low in this window — the freshest well-tested support floor. Lower (e.g. 120) = tighter, only recent lows count. Higher (e.g. 500) = wider, catches longer-term floors.">Structural Lookback (bars)</label>
+        <input type="number" id="dbtStructuralLookback" value="250" min="30" max="1000"
+          class="w-full px-3 py-2 rounded-lg bg-card2 border border-border/50 font-mono text-sm text-white
+                 focus:outline-none focus:border-accent/50 transition-all">
+      </div>
+      <div>
+        <label class="block font-ui text-xs font-600 text-slate-400 uppercase tracking-wider mb-1.5" title="A trade qualifies as 'near structural low' if the entry price is within this % ABOVE the deepest unbroken swing low in the lookback window. Default 5% = entry must be within 5% of the 250-bar structural floor. Lower (2%) = stricter (only entries right at the floor), higher (10%) = looser (catches entries a bit above the floor).">Structural Threshold %</label>
+        <input type="number" id="dbtStructuralThreshold" value="5" min="0.5" max="20" step="0.5"
+          class="w-full px-3 py-2 rounded-lg bg-card2 border border-border/50 font-mono text-sm text-white
+                 focus:outline-none focus:border-accent/50 transition-all">
+      </div>
       <!-- ── Volatility-Adjusted Target inputs ────────────────────────────── -->
       <!-- When mode="atr", each trade's target_price is computed from ATR
            instead of a flat target_pct. This adapts the target to each stock's
@@ -2976,6 +2996,16 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
                         peer-checked:translate-x-5 peer-checked:bg-accent2"></div>
           </div>
           <span class="font-ui text-sm text-slate-300">Filter Non-Pullback <span class="text-xs text-slate-500" id="dbtFilterPullbackLabel">(≥10%)</span></span>
+        </label>
+        <label class="flex items-center gap-2 cursor-pointer" title="Exclude trades whose entry is NOT near the 250-bar structural low (deepest unbroken swing low in the last 'Structural Lookback' bars). 'Near' = entry within 'Structural Threshold %' above the low. These are fresh breakouts bouncing off a well-tested support floor — they should outperform extended breakouts far above any recent low because the nearby floor absorbs rejection and offers a tight invalidation level. Keep this OFF initially to see the structural_aggregate A/B stats — if near-structural trades clearly outperform, enable this filter to drop the weaker extended setups.">
+          <div class="relative">
+            <input type="checkbox" id="dbtFilterNearStructural" class="sr-only peer">
+            <div class="w-10 h-5 bg-card2 border border-border/50 rounded-full peer
+                        peer-checked:bg-warn/20 peer-checked:border-warn/40 transition-all"></div>
+            <div class="absolute top-0.5 left-0.5 w-4 h-4 bg-slate-500 rounded-full transition-all
+                        peer-checked:translate-x-5 peer-checked:bg-warn"></div>
+          </div>
+          <span class="font-ui text-sm text-slate-300">Filter Non-Near-Structural <span class="text-xs text-slate-500" id="dbtFilterNearStructuralLabel">(250b, ±5%)</span></span>
         </label>
       </div>
     </div>
@@ -3315,6 +3345,91 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
     </div>
   </section>
 
+  <!-- Structural Low (250-bar) Analysis Section (always visible — structural low is always computed) -->
+  <section id="dbtStructSection" class="hidden fade-slide">
+    <div class="glass-card rounded-2xl p-6">
+      <div class="flex items-center gap-2 mb-4 flex-wrap">
+        <span class="text-lg">🏛️</span>
+        <h2 class="font-ui text-lg font-700 text-white">Structural Low (250-bar) Analysis</h2>
+        <span id="dbtStructSummary" class="font-mono text-xs text-slate-500 ml-2"></span>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <!-- Near Structural Low (high-quality setup — entry bouncing off fresh support floor) -->
+        <div>
+          <div class="flex items-center gap-2 mb-3">
+            <span class="inline-block w-3 h-3 rounded-full bg-warn"></span>
+            <h3 class="font-ui text-sm font-700 text-warn uppercase tracking-wider">Near Structural</h3>
+            <span class="ml-auto font-mono text-xs text-slate-500" id="dbtNearStructLabel">within 5% of 250-bar low</span>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-white" id="dbtNearStructTrades">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Trades</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-warn" id="dbtNearStructWinRate">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Win Rate</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-accent" id="dbtNearStructAvgWin">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Avg Win %</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-danger" id="dbtNearStructAvgLoss">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Avg Loss %</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-warn" id="dbtNearStructTotalReturn">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Total Return %</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-warn" id="dbtNearStructExpectancy">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Expectancy %</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Away from Structural Low (extended breakouts — no nearby support floor) -->
+        <div>
+          <div class="flex items-center gap-2 mb-3">
+            <span class="inline-block w-3 h-3 rounded-full bg-slate-500"></span>
+            <h3 class="font-ui text-sm font-700 text-slate-400 uppercase tracking-wider">Away Structural (Extended)</h3>
+            <span class="ml-auto font-mono text-xs text-slate-500">&gt; threshold % above low</span>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-white" id="dbtAwayStructTrades">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Trades</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-slate-400" id="dbtAwayStructWinRate">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Win Rate</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-accent" id="dbtAwayStructAvgWin">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Avg Win %</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-danger" id="dbtAwayStructAvgLoss">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Avg Loss %</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-slate-400" id="dbtAwayStructTotalReturn">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Total Return %</p>
+            </div>
+            <div class="bt-stat-card">
+              <p class="font-mono text-xl font-700 text-slate-400" id="dbtAwayStructExpectancy">—</p>
+              <p class="font-ui text-xs text-slate-500 mt-1">Expectancy %</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <p id="dbtStructInsight" class="mt-4 font-ui text-xs text-slate-500 leading-relaxed"></p>
+    </div>
+  </section>
+
   <!-- Volatility-Adjusted Target Analysis Section (always visible — ATR is always computed) -->
   <section id="dbtVolTargetSection" class="hidden fade-slide">
     <div class="glass-card rounded-2xl p-6">
@@ -3510,6 +3625,8 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
               <th class="px-4 py-3">Res Dist %</th>
               <th class="px-4 py-3" title="Highest High in the Pullback Lookback window BEFORE the breakout day. This is the 'previous high' the stock is recovering from. Empty when lookback window is empty (very first bars of data).">Prior High ₹</th>
               <th class="px-4 py-3" title="How far the entry price has pulled back from the Prior High: (prior_high - entry_price) / prior_high × 100. Positive = stock has corrected (good entry). Negative or 0 = stock is at/above its recent high (extended — risky chase entry).">Pullback %</th>
+              <th class="px-4 py-3" title="Deepest UNBROKEN Williams-Fractal swing low in the last 'Structural Lookback' bars (default 250 ≈ 1 trading year on NSE), ending at the breakout bar (exclusive). This is the fresh, well-tested support floor the breakout is bouncing off. Empty when no swing low exists in the window (very early bars).">Struct Low ₹ (250b)</th>
+              <th class="px-4 py-3" title="Δ% above the 250-bar Structural Low: (entry_price - struct_low) / struct_low × 100. Small positive = entry is near the floor (high-quality setup, tight invalidation). Large positive = entry is far above the floor (extended, no nearby support). Badge ✓ = within 'Structural Threshold %' (near-structural).">Struct Δ%</th>
               <th class="px-4 py-3" title="ATR (Average True Range) as % of price at the breakout day. Higher = more volatile stock. Used to compute the Eff Target % when Target Mode = 'atr'.">ATR %</th>
               <th class="px-4 py-3" title="Effective Target %: the actual target % applied to this trade. When Target Mode = 'fixed', this equals the Target % input. When 'atr', this is clamp(multiplier × ATR/price × 100, floor, cap) — adapted to each stock's volatility.">Eff Target %</th>
               <th class="px-4 py-3">Target ₹</th>
@@ -7925,6 +8042,13 @@ async function runDurationBacktest() {
     pullback_lookback_days:  parseInt(document.getElementById('dbtPullbackLookback').value) || 60,
     pullback_threshold_pct:  parseFloat(document.getElementById('dbtPullbackThreshold').value) || 10.0,
     filter_pullback:         document.getElementById('dbtFilterPullback').checked,
+    // 250-bar Structural Low (entry-quality filter — user's new feature):
+    // Computes the deepest UNBROKEN swing low in the last N bars (default
+    // 250 ≈ 1 trading year on NSE) and keeps only trades whose entry is
+    // within X% above that low. Mirror of the pullback filter pattern.
+    structural_lookback_bars:  parseInt(document.getElementById('dbtStructuralLookback').value) || 250,
+    structural_threshold_pct:  parseFloat(document.getElementById('dbtStructuralThreshold').value) || 5.0,
+    filter_near_structural:    document.getElementById('dbtFilterNearStructural').checked,
     // Volatility-Adjusted Target (per-trade target_pct from ATR):
     vol_target_mode:        document.getElementById('dbtVolTargetMode').value || 'fixed',
     vol_target_atr_period:  parseInt(document.getElementById('dbtVolTargetAtrPeriod').value) || 14,
@@ -8232,6 +8356,10 @@ function dbtRenderResults() {
   dbtRenderPullbackComparison();
   document.getElementById('dbtPullbackSection').classList.remove('hidden');
 
+  // Structural Low (250-bar) analysis section (always shown — structural low is always computed)
+  dbtRenderStructComparison();
+  document.getElementById('dbtStructSection').classList.remove('hidden');
+
   // Volatility-Adjusted Target analysis section (always shown — ATR is always computed)
   dbtRenderVolTargetComparison();
   document.getElementById('dbtVolTargetSection').classList.remove('hidden');
@@ -8399,6 +8527,70 @@ function dbtRenderPullbackComparison() {
     insight.innerHTML = '<span class="text-slate-400">No pullback-setup trades found — every breakout happened on a stock at or above its ' + lookback + '-day high. Try lowering the threshold or shortening the lookback window.</span>';
   } else if (nonPb.total_trades === 0) {
     insight.innerHTML = '<span class="text-accent2">All trades qualified as pullback setups — every breakout happened after a ≥ ' + threshold + '% correction from the ' + lookback + '-day high. Consider tightening the threshold to find the most selective filter.</span>';
+  } else {
+    insight.textContent = '';
+  }
+}
+
+/**
+ * Render the Structural Low (250-bar) Analysis section.
+ * Mirrors dbtRenderPullbackComparison() — side-by-side cards for near vs
+ * away-from-structural trades, summary line, and an insight that highlights
+ * the win-rate / total-return delta between the two buckets.
+ */
+function dbtRenderStructComparison() {
+  const structAgg = _dbtResults.structural_aggregate || {};
+  const near      = structAgg.near_structural || {};
+  const away      = structAgg.away_structural || {};
+  const cfg       = _dbtResults.config || {};
+
+  // Near-Structural cards
+  document.getElementById('dbtNearStructTrades').textContent      = near.total_trades != null ? near.total_trades : '—';
+  document.getElementById('dbtNearStructWinRate').textContent     = near.win_rate_pct != null ? near.win_rate_pct + '%' : '—';
+  document.getElementById('dbtNearStructAvgWin').textContent       = near.avg_win_pct != null ? '+' + near.avg_win_pct + '%' : '—';
+  document.getElementById('dbtNearStructAvgLoss').textContent      = near.avg_loss_pct != null ? near.avg_loss_pct + '%' : '—';
+  document.getElementById('dbtNearStructTotalReturn').textContent  = near.total_return_pct != null ? (near.total_return_pct >= 0 ? '+' : '') + near.total_return_pct + '%' : '—';
+  document.getElementById('dbtNearStructExpectancy').textContent   = near.expectancy_pct != null ? near.expectancy_pct + '%' : '—';
+
+  // Away-Structural cards
+  document.getElementById('dbtAwayStructTrades').textContent      = away.total_trades != null ? away.total_trades : '—';
+  document.getElementById('dbtAwayStructWinRate').textContent     = away.win_rate_pct != null ? away.win_rate_pct + '%' : '—';
+  document.getElementById('dbtAwayStructAvgWin').textContent       = away.avg_win_pct != null ? '+' + away.avg_win_pct + '%' : '—';
+  document.getElementById('dbtAwayStructAvgLoss').textContent      = away.avg_loss_pct != null ? away.avg_loss_pct + '%' : '—';
+  document.getElementById('dbtAwayStructTotalReturn').textContent  = away.total_return_pct != null ? (away.total_return_pct >= 0 ? '+' : '') + away.total_return_pct + '%' : '—';
+  document.getElementById('dbtAwayStructExpectancy').textContent   = away.expectancy_pct != null ? away.expectancy_pct + '%' : '—';
+
+  // Summary line + side label
+  const lookback   = cfg.structural_lookback_bars   != null ? cfg.structural_lookback_bars   : (structAgg.structural_lookback_bars || 250);
+  const threshold  = cfg.structural_threshold_pct   != null ? cfg.structural_threshold_pct   : (structAgg.structural_threshold_pct || 5.0);
+  const nearCount  = structAgg.near_structural_count     != null ? structAgg.near_structural_count     : (near.total_trades || 0);
+  const awayCount  = structAgg.away_structural_count     != null ? structAgg.away_structural_count     : (away.total_trades || 0);
+  const noDataCount = structAgg.no_structural_data_count != null ? structAgg.no_structural_data_count : 0;
+  const totalTrades = nearCount + awayCount;
+  const nearPct = totalTrades > 0 ? Math.round(nearCount / totalTrades * 100) : 0;
+  document.getElementById('dbtNearStructLabel').textContent = `within ${threshold}% of ${lookback}-bar low`;
+  document.getElementById('dbtStructSummary').textContent =
+    `${lookback}-bar low | threshold ${threshold}% | ` +
+    `${nearCount} near / ${awayCount} away / ${noDataCount} no-data (${nearPct}% qualified)` +
+    (cfg.filter_near_structural ? '  •  FILTER ON (non-near excluded)' : '');
+
+  // Insight text
+  const insight = document.getElementById('dbtStructInsight');
+  if (near.total_trades > 0 && away.total_trades > 0 &&
+      near.win_rate_pct != null && away.win_rate_pct != null) {
+    const wrDiff = (near.win_rate_pct - away.win_rate_pct).toFixed(1);
+    const trDiff = ((near.total_return_pct || 0) - (away.total_return_pct || 0)).toFixed(2);
+    const wrSign = wrDiff > 0 ? 'higher' : 'lower';
+    const trSign = trDiff > 0 ? 'higher' : 'lower';
+    insight.innerHTML = `<span class="text-warn">Near-structural</span> trades have a win rate <b class="text-accent">${Math.abs(wrDiff)}% ${wrSign}</b> ` +
+                        `and total return <b class="text-accent">${Math.abs(trDiff)}% ${trSign}</b> than away-structural (extended) trades. ` +
+                        (cfg.filter_near_structural
+                          ? 'Filter is ON — non-near trades are excluded from the main aggregate above.'
+                          : 'Toggle <b>Filter Non-Near-Structural</b> above to exclude extended breakouts and see if performance improves.');
+  } else if (near.total_trades === 0) {
+    insight.innerHTML = '<span class="text-slate-400">No near-structural trades found — every breakout happened far above the ' + lookback + '-bar structural low. Try widening the threshold or shortening the lookback window.</span>';
+  } else if (away.total_trades === 0) {
+    insight.innerHTML = '<span class="text-warn">All trades qualified as near-structural — every breakout happened within ' + threshold + '% of the ' + lookback + '-bar structural low. Consider tightening the threshold to find the most selective filter.</span>';
   } else {
     insight.textContent = '';
   }
@@ -8610,8 +8802,9 @@ function dbtRenderTradesTable() {
     : `${trades.length} trade(s)`;
   document.getElementById('dbtTradeCount').textContent = countLabel;
   if (trades.length === 0) {
-    // Bumped from 14 → 16 to account for the new Peak High + Days to Peak columns
-    const colspan = 16;
+    // Bumped from 16 → 18 to account for the new Structural Low (250b) + Struct Δ% columns
+    // (Prior High + Pullback % + Peak High + Days to Peak were already in the 16 count).
+    const colspan = 18;
     tbody.innerHTML = `<tr><td colspan="${colspan}" class="px-4 py-8 text-center text-slate-500 font-mono text-sm">No trades in this date range.</td></tr>`;
     return;
   }
@@ -8689,6 +8882,42 @@ function dbtRenderTradesTable() {
       pullbackCell = `<td class="px-4 py-3 font-mono text-xs text-slate-600">—</td>`;
     }
 
+    // ── 250-bar Structural Low column rendering ──────────────────────────
+    // Shows the deepest UNBROKEN swing low in the last N bars (default 250)
+    // and how far above it the entry is. Badge ✓ when "near structural" (within
+    // the user's threshold %). Color logic on Δ%:
+    //   0..threshold = green (near structural floor — high-quality setup)
+    //   threshold..15 = amber (mild distance from floor)
+    //   >15 = slate (far above floor — extended, no nearby support)
+    //   negative = red (price below structural low — broken support)
+    let structLowCell, structDistCell;
+    if (t.structural_low_250_price != null) {
+      const isNear = t.is_near_structural_low_250 === true;
+      const slCls  = isNear ? 'text-warn font-700' : 'text-slate-400';
+      const slBadge = isNear ? ' <span class="text-warn text-xs">✓</span>' : '';
+      const slLookback = t.structural_low_250_lookback_bars || 250;
+      const slSource = t.structural_low_250_source === 'lowest_low_fallback'
+        ? ' (lowest-low fallback — no fractal pivot)'
+        : ' (deepest unbroken Williams-Fractal swing low)';
+      structLowCell = `<td class="px-4 py-3 font-mono text-sm ${slCls}" title="250-bar Structural Low: deepest UNBROKEN swing low in the last ${slLookback} bars${slSource}. Formed ${t.structural_low_250_date || ''} (${t.structural_low_250_days_ago != null ? t.structural_low_250_days_ago : '—'} bars ago). This is the fresh support floor the breakout is bouncing off.">₹${t.structural_low_250_price}${slBadge}</td>`;
+      if (t.structural_low_250_proximity_pct != null) {
+        let sdCls;
+        const thr = (cfg => (cfg && cfg.structural_threshold_pct != null) ? cfg.structural_threshold_pct : 5)(_dbtResults.config || {});
+        if (t.structural_low_250_proximity_pct < 0)      sdCls = 'text-danger font-700';   // broken support — red
+        else if (t.structural_low_250_proximity_pct <= thr) sdCls = 'bt-win font-700';        // within threshold — green (near)
+        else if (t.structural_low_250_proximity_pct <= 15)  sdCls = 'text-warn';              // mild distance — amber
+        else                                                sdCls = 'text-slate-500';         // far above — neutral
+        const sdSign = t.structural_low_250_proximity_pct >= 0 ? '+' : '';
+        structDistCell = `<td class="px-4 py-3 font-mono text-xs ${sdCls}" title="Δ% above 250-bar Structural Low: (entry_price - struct_low) / struct_low × 100. Within ${thr}% = ✓ near-structural (high-quality setup).">${sdSign}${t.structural_low_250_proximity_pct}%</td>`;
+      } else {
+        structDistCell = `<td class="px-4 py-3 font-mono text-xs text-slate-500">—</td>`;
+      }
+    } else {
+      // No structural-low data (lookback window was empty — very first bars)
+      structLowCell = `<td class="px-4 py-3 font-mono text-xs text-slate-600" title="No structural-low data — lookback window was empty (early bars of data, before ${t.structural_low_250_lookback_bars || 250} bars of history were available)">—</td>`;
+      structDistCell = `<td class="px-4 py-3 font-mono text-xs text-slate-600">—</td>`;
+    }
+
     // ATR % + Effective Target % column rendering
     // ATR % : volatility context (high = wild mover, low = stable). Always shown.
     // Eff Target % : the actual target % applied. When mode="fixed", equals target_pct. When "atr",
@@ -8728,6 +8957,8 @@ function dbtRenderTradesTable() {
         ${resDistCell}
         ${priorHighCell}
         ${pullbackCell}
+        ${structLowCell}
+        ${structDistCell}
         ${atrPctCell}
         ${effTargetCell}
         <td class="px-4 py-3 font-mono text-sm text-slate-400">₹${t.target_price}</td>
@@ -10026,6 +10257,9 @@ function dbtExportTradesCsv() {
       'Is Undervalued (Prime)', 'FV Gap %',
       'Resistance Price', 'Resistance Dist %', 'Is Near Resistance',
       'Prior High', 'Pullback Dist %', 'Is Pullback',
+      'Structural Low 250 (Price)', 'Structural Low 250 (Date)', 'Structural Low 250 (Days Ago)',
+      'Structural Low 250 (Proximity %)', 'Structural Low 250 (Lookback Bars)',
+      'Structural Low 250 (Source)', 'Is Near Structural Low 250',
       'ATR at Entry', 'ATR % at Entry', 'Effective Target %', 'Target Mode',
       'Target Price', 'Exit Date', 'Exit Price',
       'Peak High (Post-Target to 9EMA Break)', 'Days to Peak (from Entry)', 'Peak Gain %',
@@ -10047,6 +10281,14 @@ function dbtExportTradesCsv() {
         t.prior_high != null ? t.prior_high : '',
         t.pullback_dist_pct != null ? t.pullback_dist_pct : '',
         t.is_pullback === true ? 'YES' : 'NO',
+        // 250-bar Structural Low fields (user's new feature):
+        t.structural_low_250_price != null ? t.structural_low_250_price : '',
+        t.structural_low_250_date != null ? t.structural_low_250_date : '',
+        t.structural_low_250_days_ago != null ? t.structural_low_250_days_ago : '',
+        t.structural_low_250_proximity_pct != null ? t.structural_low_250_proximity_pct : '',
+        t.structural_low_250_lookback_bars != null ? t.structural_low_250_lookback_bars : '',
+        t.structural_low_250_source || '',
+        t.is_near_structural_low_250 === true ? 'YES' : (t.is_near_structural_low_250 === false ? 'NO' : ''),
         t.atr_at_entry != null ? t.atr_at_entry : '',
         t.atr_pct_at_entry != null ? t.atr_pct_at_entry : '',
         t.effective_target_pct != null ? t.effective_target_pct : '',
@@ -10054,9 +10296,9 @@ function dbtExportTradesCsv() {
         t.target_price,
         t.exit_date || '',
         t.exit_price != null ? t.exit_price : '',
-        t.peak_high != null ? t.peak_high : '',            // ← NEW
-        t.days_to_peak != null ? t.days_to_peak : '',      // ← NEW
-        t.peak_gain_pct != null ? t.peak_gain_pct : '',    // ← NEW
+        t.peak_high != null ? t.peak_high : '',            // ← NEW (peak)
+        t.days_to_peak != null ? t.days_to_peak : '',      // ← NEW (peak)
+        t.peak_gain_pct != null ? t.peak_gain_pct : '',    // ← NEW (peak)
         t.days_held != null ? t.days_held : '',
         t.gain_pct != null ? t.gain_pct : '',
         t.outcome || '',
@@ -10119,6 +10361,9 @@ function dbtExportFullReportCsv() {
   sections.push(['Pullback Lookback Days', cfg.pullback_lookback_days]);
   sections.push(['Pullback Threshold %', cfg.pullback_threshold_pct]);
   sections.push(['Filter Non-Pullback', cfg.filter_pullback ? 'Yes' : 'No']);
+  sections.push(['Structural Lookback Bars', cfg.structural_lookback_bars]);
+  sections.push(['Structural Threshold %', cfg.structural_threshold_pct]);
+  sections.push(['Filter Non-Near-Structural', cfg.filter_near_structural ? 'Yes' : 'No']);
   sections.push(['Vol Target Mode', cfg.vol_target_mode]);
   sections.push(['Vol Target ATR Period', cfg.vol_target_atr_period]);
   sections.push(['Vol Target Multiplier', cfg.vol_target_multiplier]);
@@ -10230,6 +10475,9 @@ function dbtExportFullReportCsv() {
                  'Is Undervalued (Prime)', 'FV Gap %',
                  'Resistance Price', 'Resistance Dist %', 'Is Near Resistance',
                  'Prior High', 'Pullback Dist %', 'Is Pullback',
+                 'Structural Low 250 (Price)', 'Structural Low 250 (Date)', 'Structural Low 250 (Days Ago)',
+                 'Structural Low 250 (Proximity %)', 'Structural Low 250 (Lookback Bars)',
+                 'Structural Low 250 (Source)', 'Is Near Structural Low 250',
                  'ATR at Entry', 'ATR % at Entry', 'Effective Target %', 'Target Mode',
                  'Target Price', 'Exit Date', 'Exit Price',
                  'Peak High (Post-Target to 9EMA Break)', 'Days to Peak (from Entry)', 'Peak Gain %',
@@ -10252,6 +10500,14 @@ function dbtExportFullReportCsv() {
       t.prior_high != null ? t.prior_high : '',
       t.pullback_dist_pct != null ? t.pullback_dist_pct : '',
       t.is_pullback === true ? 'YES' : 'NO',
+      // 250-bar Structural Low fields (user's new feature):
+      t.structural_low_250_price != null ? t.structural_low_250_price : '',
+      t.structural_low_250_date != null ? t.structural_low_250_date : '',
+      t.structural_low_250_days_ago != null ? t.structural_low_250_days_ago : '',
+      t.structural_low_250_proximity_pct != null ? t.structural_low_250_proximity_pct : '',
+      t.structural_low_250_lookback_bars != null ? t.structural_low_250_lookback_bars : '',
+      t.structural_low_250_source || '',
+      t.is_near_structural_low_250 === true ? 'YES' : (t.is_near_structural_low_250 === false ? 'NO' : ''),
       t.atr_at_entry != null ? t.atr_at_entry : '',
       t.atr_pct_at_entry != null ? t.atr_pct_at_entry : '',
       t.effective_target_pct != null ? t.effective_target_pct : '',
@@ -10307,6 +10563,28 @@ function dbtExportFullReportCsv() {
                    npb.expectancy_pct != null ? npb.expectancy_pct : '', npb.total_return_pct != null ? npb.total_return_pct : '']);
     sections.push(['Pullback Count', pbAgg.pullback_count || 0, '', '', '', '', '', '', '', '', '']);
     sections.push(['Non-Pullback Count', pbAgg.non_pullback_count || 0, '', '', '', '', '', '', '', '', '']);
+    sections.push('');
+  }
+
+  // ── Section 7c-bis: 250-bar Structural Low Aggregate ──
+  const structAgg = _dbtResults.structural_aggregate || {};
+  if (structAgg.near_structural || structAgg.away_structural) {
+    sections.push('## Structural Low (250-bar) Aggregate');
+    sections.push(`# Structural Lookback: ${structAgg.structural_lookback_bars || cfg.structural_lookback_bars || 250} bars | Threshold: ${structAgg.structural_threshold_pct || cfg.structural_threshold_pct || 5}% | Filter: ${structAgg.filter_near_structural ? 'ON' : 'OFF'}`);
+    sections.push(['Category', 'Trades', 'Wins', 'Losses', 'Timeouts', 'Win Rate %', 'Avg Gain %', 'Avg Win %', 'Avg Loss %', 'Expectancy %', 'Total Return %']);
+    const ns = structAgg.near_structural || {};
+    const as = structAgg.away_structural   || {};
+    sections.push(['Near Structural (within threshold %)', ns.total_trades || 0, ns.wins || 0, ns.losses || 0, ns.timeouts || 0,
+                   ns.win_rate_pct != null ? ns.win_rate_pct : '', ns.avg_gain_pct != null ? ns.avg_gain_pct : '',
+                   ns.avg_win_pct != null ? ns.avg_win_pct : '', ns.avg_loss_pct != null ? ns.avg_loss_pct : '',
+                   ns.expectancy_pct != null ? ns.expectancy_pct : '', ns.total_return_pct != null ? ns.total_return_pct : '']);
+    sections.push(['Away Structural (Extended)', as.total_trades || 0, as.wins || 0, as.losses || 0, as.timeouts || 0,
+                   as.win_rate_pct != null ? as.win_rate_pct : '', as.avg_gain_pct != null ? as.avg_gain_pct : '',
+                   as.avg_win_pct != null ? as.avg_win_pct : '', as.avg_loss_pct != null ? as.avg_loss_pct : '',
+                   as.expectancy_pct != null ? as.expectancy_pct : '', as.total_return_pct != null ? as.total_return_pct : '']);
+    sections.push(['Near-Structural Count', structAgg.near_structural_count || 0, '', '', '', '', '', '', '', '', '']);
+    sections.push(['Away-Structural Count', structAgg.away_structural_count || 0, '', '', '', '', '', '', '', '', '']);
+    sections.push(['No-Structural-Data Count', structAgg.no_structural_data_count || 0, '', '', '', '', '', '', '', '', '']);
     sections.push('');
   }
 

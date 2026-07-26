@@ -43,7 +43,7 @@
   "ema9_momentum_sweep_min_ema9_dist_pct": 0.5,
   "ema9_momentum_sweep_max_ema9_dist_pct": 8.0,
   "ema9_momentum_sweep_target_pct": 3.0,
-  "chartink_feed_enabled": true,
+  "chartink_feed_enabled": false,
   "chartink_enrich_near_support": true,
   "ema9_uptrend_mode": "relaxed",
   "surge_min_body_pct": 0.3,
