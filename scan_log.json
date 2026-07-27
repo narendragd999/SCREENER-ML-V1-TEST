@@ -322,5 +322,23 @@
     "tickers_scanned": 307,
     "signals_found": 0,
     "nse_calls": 190
+  },
+  {
+    "time": "2026-07-27 12:09:00",
+    "tickers_scanned": 307,
+    "signals_found": 0,
+    "nse_calls": 192
+  },
+  {
+    "time": "2026-07-27 12:24:32",
+    "tickers_scanned": 307,
+    "signals_found": 0,
+    "nse_calls": 190
+  },
+  {
+    "time": "2026-07-27 12:40:38",
+    "tickers_scanned": 307,
+    "signals_found": 0,
+    "nse_calls": 194
   }
 ]
