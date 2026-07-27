@@ -2821,6 +2821,7 @@ Applies to Manual Screen, CSV Upload, Quick Scan, and Chartink Live Feed."
     <div class="mb-5">
       <label class="block font-ui text-xs font-600 text-slate-400 uppercase tracking-wider mb-2">Duration Presets</label>
       <div class="flex gap-2 flex-wrap">
+        <button onclick="dbtSetPreset('1w')" class="px-3 py-1.5 rounded-lg font-ui font-600 text-xs bg-card2 border border-border/50 text-slate-300 hover:border-accent/40 hover:text-accent transition-all">1W</button>
         <button onclick="dbtSetPreset('1m')" class="px-3 py-1.5 rounded-lg font-ui font-600 text-xs bg-card2 border border-border/50 text-slate-300 hover:border-accent/40 hover:text-accent transition-all">1M</button>
         <button onclick="dbtSetPreset('3m')" class="px-3 py-1.5 rounded-lg font-ui font-600 text-xs bg-card2 border border-border/50 text-slate-300 hover:border-accent/40 hover:text-accent transition-all">3M</button>
         <button onclick="dbtSetPreset('6m')" class="px-3 py-1.5 rounded-lg font-ui font-600 text-xs bg-card2 border border-border/50 text-slate-300 hover:border-accent/40 hover:text-accent transition-all">6M</button>
@@ -7964,6 +7965,7 @@ function dbtSetPreset(preset) {
   const end = new Date();
   const start = new Date();
   switch (preset) {
+    case '1w':  start.setDate(start.getDate() - 7); break;
     case '1m':  start.setMonth(start.getMonth() - 1); break;
     case '3m':  start.setMonth(start.getMonth() - 3); break;
     case '6m':  start.setMonth(start.getMonth() - 6); break;
