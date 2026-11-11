@@ -1,0 +1,11 @@
+{
+  "app_name": "Opportunity Engine",
+  "port": 8500,
+  "default_target_pct": 3.0,
+  "max_candles_ago": 10,
+  "support_lookback_bars": 200,
+  "support_cluster_pct": 1.5,
+  "support_proximity_max_pct": 6.0,
+  "default_ticker_source": "tickers.csv",
+  "universe_size": 307
+}
