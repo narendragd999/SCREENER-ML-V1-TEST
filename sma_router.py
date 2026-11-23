@@ -198,12 +198,14 @@ def _scrape_section(ticker: str, section_id: str) -> Optional[pd.DataFrame]:
 def _clean_numeric(s: pd.Series) -> pd.Series:
     return (
         s.astype(str)
-         .str.replace(",", "", regex=False)
-         .str.replace(r"[^\d.-]", "", regex=True)
          .str.strip()
-         .replace("", "0")
+         .str.replace("−", "-", regex=False)
+         .str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+         .str.replace(",", "", regex=False)
+         .str.replace(r"[^\d.eE+\-]", "", regex=True)
+         .str.strip()
+         .replace("", np.nan)
          .pipe(pd.to_numeric, errors="coerce")
-         .fillna(0)
     )
 
 
@@ -257,6 +259,10 @@ def _extract_metric(row_idx, df: pd.DataFrame) -> pd.Series:
             if len(yr_str) == 2:
                 yr += 2000
             if 2000 <= yr <= 2100:
+                # Screener's Mar-2026 column is FY 2025-26. Price grouping
+                # below uses the START year, not the end year.
+                if re.match(r"(?i)^mar\s*", col_str):
+                    yr -= 1
                 years.append(yr); vals.append(series[col]); continue
         try:
             yr = int(col_str)
@@ -267,7 +273,7 @@ def _extract_metric(row_idx, df: pd.DataFrame) -> pd.Series:
     if not years:
         return pd.Series(dtype=float)
     clean = _clean_numeric(pd.Series(vals, index=years))
-    return clean[clean != 0].dropna()
+    return clean.groupby(level=0).last().dropna().sort_index()
 
 
 def _extract_quarterly_metric(row_idx, df: pd.DataFrame) -> pd.Series:
@@ -293,7 +299,38 @@ def _extract_quarterly_metric(row_idx, df: pd.DataFrame) -> pd.Series:
                     continue
     if not q_dates:
         return pd.Series(dtype=float)
-    return pd.Series(_clean_numeric(pd.Series(vals)).values, index=q_dates).dropna()
+    return pd.Series(_clean_numeric(pd.Series(vals)).values, index=q_dates).groupby(level=0).last().sort_index()
+
+
+def _continuous_ttm(series: pd.Series) -> pd.Series:
+    """A TTM observation requires four consecutive reported quarters."""
+    if series.empty:
+        return pd.Series(dtype=float)
+    series = series.sort_index()
+    quarters = pd.date_range(series.index.min(), series.index.max(), freq="QE")
+    return series.reindex(quarters).rolling(4, min_periods=4).sum().dropna()
+
+
+def _model_diagnostics(x, y, as_of: str) -> Dict:
+    """Describe price-level regressions without treating R² as accuracy."""
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    valid = np.isfinite(x).all() and np.isfinite(y).all()
+    slope = float(np.polyfit(x, y, 1)[0]) if valid and np.ptp(x) > 0 else 0.0
+    errors = []
+    if valid:
+        # Expanding fits use earlier observations for each diagnostic.
+        for i in range(4, len(x)):
+            if y[i] > 0 and np.ptp(x[:i]) > 0:
+                pred = LinearRegression().fit(x[:i, None], y[:i]).predict([[x[i]]])[0]
+                errors.append(abs(float(pred) - y[i]) / y[i] * 100.0)
+    return {
+        "sample_count": len(x), "slope": slope,
+        "fundamental_as_of": as_of,
+        "validation_mae_pct": round(float(np.mean(errors)), 2) if errors else None,
+        "validation_observations": len(errors),
+        "positive_fundamentals": bool(valid and (x > 0).all()),
+        "fit_scope": "Retrospective fundamental/price relationship; report publication dates unavailable",
+    }
 
 
 def _get_cached(ticker: str, kind: str, force: bool) -> Optional[pd.DataFrame]:
@@ -318,18 +355,21 @@ def _save_cache(ticker: str, kind: str, df: pd.DataFrame):
 # ─────────────────────────────────────────────────────────────
 def _compute_composite(result: Dict) -> Dict:
     gains, fair_prices, weights = [], [], []
-    op = result.get("op", {})
-    if op.get("pred_price") and float(op.get("r2", 0)) > 0.1:
-        w = max(0.1, float(op["r2"]))
-        gains.append(float(op["gain_pct"])); fair_prices.append(float(op["pred_price"])); weights.append(w)
-    sales = result.get("sales", {})
-    if result.get("has_sales") and sales.get("pred_price") and float(sales.get("r2", 0)) > 0.1:
-        w = max(0.1, float(sales["r2"]))
-        gains.append(float(sales["gain_pct"])); fair_prices.append(float(sales["pred_price"])); weights.append(w * 0.8)
     ttm = result.get("ttm", {})
-    if result.get("has_ttm") and ttm.get("pred_price") and float(ttm.get("r2", 0)) > 0.1:
-        w = max(0.1, float(ttm["r2"]))
-        gains.append(float(ttm["gain_pct"])); fair_prices.append(float(ttm["pred_price"])); weights.append(w * 1.2)
+    blocks = [(result.get("op", {}), 1.0, 5), (result.get("sales", {}), 0.8, 5),
+              (ttm, 1.2, 8), (ttm.get("sales", {}), 0.8, 8)]
+    for block, multiplier, min_samples in blocks:
+        try:
+            price, r2 = float(block["pred_price"]), float(block["r2"])
+            if (not np.isfinite([price, r2]).all() or price <= 0 or not 0.25 < r2 <= 1 or
+                    block.get("sample_count", 0) < min_samples or block.get("slope", 0) <= 0 or
+                    not block.get("positive_fundamentals")):
+                continue
+            gains.append(float(block["gain_pct"]))
+            fair_prices.append(price)
+            weights.append(r2 * multiplier)
+        except (KeyError, TypeError, ValueError):
+            continue
     if not gains:
         return {"composite_gain_pct": None, "composite_fair_price": None,
                 "valuation_bucket": "INSUFFICIENT_DATA", "model_count": 0}
@@ -368,7 +408,7 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
     sales_row, sales_label = _find_row(pl_df, "sales")
     if is_bank and sales_row is None and len(pl_df) > 0:
         first_idx = pl_df.index[0]
-        if any(w in first_idx.lower() for w in ["income","total","revenue",""]):
+        if any(w in first_idx.lower() for w in ["income","total","revenue"]):
             sales_row, sales_label = first_idx, "Total Income"
 
     other_row = None
@@ -378,32 +418,15 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
     def _ext(row_idx):
         if row_idx is None:
             return pd.Series(dtype=float)
-        series   = pl_df.loc[row_idx].iloc[1:]
-        raw_cols = pl_df.columns[1:]
-        years, vals = [], []
-        for i, col in enumerate(raw_cols):
-            col_str = str(col).strip()
-            if col_str.upper() == "TTM":
-                continue
-            m = re.search(r"\d{2,4}", col_str)
-            if m:
-                yr = int(m.group())
-                if 2000 <= yr <= 2100:
-                    years.append(yr); vals.append(series.iloc[i]); continue
-            try:
-                yr = int(col_str)
-                if 2000 <= yr <= 2100:
-                    years.append(yr); vals.append(series.iloc[i])
-            except Exception:
-                continue
-        if not years:
-            return pd.Series(dtype=float)
-        clean = _clean_numeric(pd.Series(vals, index=years))
-        return clean[clean != 0].dropna()
+        # Cached tables have Metric as their index: every column is data.
+        return _extract_metric(row_idx, pl_df)
 
     profit_s = _ext(profit_row)
     sales_s  = _ext(sales_row) if sales_row else pd.Series(dtype=float)
     other_s  = _ext(other_row) if other_row else pd.Series(dtype=float)
+    today = dt_module.datetime.now(dt_module.timezone(dt_module.timedelta(hours=5, minutes=30))).date()
+    profit_s = profit_s[[dt_module.date(int(y) + 1, 3, 31) <= today for y in profit_s.index]]
+    sales_s = sales_s[[dt_module.date(int(y) + 1, 3, 31) <= today for y in sales_s.index]]
 
     if include_other_income and not other_s.empty and is_bank:
         common = profit_s.index.intersection(other_s.index)
@@ -416,13 +439,13 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
 
     try:
         start_str = f"{fy_start}-04-01"
-        end_str   = f"{dt_module.date.today().year + 1}-03-31"
+        end_str   = str(today + dt_module.timedelta(days=1))
         t = yf.Ticker(f"{ticker}.NS")
         price_df = t.history(start=start_str, end=end_str, auto_adjust=True)
         # history() returns tz-aware index; strip tz so groupby/resample work cleanly
         if price_df is not None and not price_df.empty:
-            price_df.index = price_df.index.tz_localize(None) if price_df.index.tz is None \
-                             else price_df.index.tz_convert(None)
+            from core.data_fetcher import clean_ohlcv
+            price_df = clean_ohlcv(price_df, completed_only=True)
     except Exception as exc:
         return {"ticker": ticker, "error": f"yfinance error: {exc}"}
 
@@ -435,8 +458,8 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
     current_price = round(float(price_df["Close"].iloc[-1]), 2)
 
     common_yrs = sorted(profit_s.index.intersection(fy_end_price.index))
-    if len(common_yrs) < 2:
-        return {"ticker": ticker, "error": "Need ≥2 overlapping years of data"}
+    if len(common_yrs) < 5:
+        return {"ticker": ticker, "error": "Need at least 5 aligned annual observations; two-point R² is unreliable"}
 
     profit_v  = np.array(profit_s.loc[common_yrs]).flatten()
     price_v   = np.array(fy_end_price.loc[common_yrs]).flatten()
@@ -466,7 +489,7 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
     sales_out = {}; has_sales = False
     if not sales_s.empty:
         sy = sorted(sales_s.index.intersection(fy_end_price.index))
-        if len(sy) >= 2:
+        if len(sy) >= 5:
             has_sales = True
             sv = np.array(sales_s.loc[sy]).flatten()
             pv = np.array(fy_end_price.loc[sy]).flatten()
@@ -496,6 +519,7 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
                 "pred_price": pred_s, "gain_pct": gain_s, "r2": r2_s,
                 "eq": eq_s, "label": sales_label,
                 "series": sales_series_out, "historical": hist_s,
+                **_model_diagnostics(sv, pv, str(dt_module.date(int(sy[-1]) + 1, 3, 31))),
             }
 
     price_hist = [
@@ -515,11 +539,12 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
         s_row_q, s_lbl_q = _find_row(qr_df, "sales")
         if is_bank and s_row_q is None and len(qr_df) > 0:
             fi = qr_df.index[0]
-            if any(w in fi.lower() for w in ["income","total","revenue",""]):
+            if any(w in fi.lower() for w in ["income","total","revenue"]):
                 s_row_q, s_lbl_q = fi, "Total Income"
 
         if p_row_q:
             profit_q = _extract_quarterly_metric(p_row_q, qr_df).sort_index()
+            profit_q = profit_q[profit_q.index.date <= today]
             if include_other_income and is_bank:
                 or_q_row, _ = _find_row(qr_df, "other_income")
                 if or_q_row:
@@ -529,11 +554,9 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
                         profit_q.loc[cq] += oi_q.loc[cq]
             if len(profit_q) >= 4:
                 price_q  = price_df["Close"].resample("QE").last().round(2)
-                ttm_vals = [profit_q.iloc[i-3:i+1].sum() for i in range(3, len(profit_q))]
-                ttm_idx  = profit_q.index[3:]
-                ttm_s    = pd.Series(ttm_vals, index=ttm_idx)
+                ttm_s = _continuous_ttm(profit_q)
                 common_t = sorted(ttm_s.index.intersection(price_q.index))
-                if len(common_t) >= 2:
+                if len(common_t) >= 5:
                     has_ttm = True
                     tv  = np.array(ttm_s.loc[common_t]).flatten()
                     pqv = np.array(price_q.loc[common_t]).flatten()
@@ -563,17 +586,17 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
                         "pred_price": pred_t, "gain_pct": gain_t, "r2": r2_t,
                         "eq": eq_t, "label": profit_label,
                         "series": ttm_series_out, "historical": hist_t,
+                        **_model_diagnostics(tv, pqv, str(common_t[-1].date())),
                     }
 
         if s_row_q:
             sales_q = _extract_quarterly_metric(s_row_q, qr_df).sort_index()
+            sales_q = sales_q[sales_q.index.date <= today]
             if len(sales_q) >= 4:
                 price_q2  = price_df["Close"].resample("QE").last().round(2)
-                ttm_sv    = [sales_q.iloc[i-3:i+1].sum() for i in range(3, len(sales_q))]
-                ttm_si    = sales_q.index[3:]
-                ttm_ss    = pd.Series(ttm_sv, index=ttm_si)
+                ttm_ss = _continuous_ttm(sales_q)
                 common_ts = sorted(ttm_ss.index.intersection(price_q2.index))
-                if len(common_ts) >= 2:
+                if len(common_ts) >= 5:
                     sv2  = np.array(ttm_ss.loc[common_ts]).flatten()
                     pv2  = np.array(price_q2.loc[common_ts]).flatten()
                     m_ts = LinearRegression().fit(sv2.reshape(-1,1), pv2)
@@ -602,16 +625,24 @@ def _analyze_ticker(ticker: str, fy_start: int, force: bool, include_other_incom
                         "pred_price": pred_ts, "gain_pct": gain_ts, "r2": r2_ts,
                         "eq": eq_ts, "label": s_lbl_q,
                         "series": ttm_sales_series, "historical": hist_ts,
+                        **_model_diagnostics(sv2, pv2, str(common_ts[-1].date())),
                     }
+
+    # A usable TTM sales model remains available when quarterly profit data
+    # is absent; its evidence is assessed separately by the valuation gate.
+    has_ttm = has_ttm or bool(ttm_out.get("sales"))
 
     result = {
         "ticker": ticker, "current_price": current_price,
         "is_bank": is_bank, "profit_label": profit_label, "years_count": len(common_yrs),
         "op":      {"pred_price": pred_op, "gain_pct": gain_op, "r2": r2_op, "eq": eq_op,
-                    "series": profit_series_out, "historical": hist_op},
+                    "series": profit_series_out, "historical": hist_op,
+                    **_model_diagnostics(profit_v, price_v, str(dt_module.date(int(common_yrs[-1]) + 1, 3, 31)))},
         "has_sales": has_sales, "sales": sales_out if has_sales else {},
         "has_ttm":   has_ttm,   "ttm":   ttm_out  if has_ttm   else {},
         "price_history": price_hist,
+        "price_as_of": str(price_df.index[-1].date()),
+        "historical_fair_values_point_in_time_safe": False,
     }
     result.update(_compute_composite(result))
     return result

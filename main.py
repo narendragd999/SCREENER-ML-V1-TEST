@@ -1,4106 +1,677 @@
 """
-NSE Momentum Loss Screener — FastAPI Backend
-============================================
-Run: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-
-THESIS
-------
-1. Stock surges >= N% continuously (green candles with higher highs;
-   red candles allowed only if they do NOT close below the previous
-   candle's low — i.e. the higher-low structure stays intact).
-2. Surge must have ended within `surge_recency_days` trading sessions
-   of today — ensures the breakdown happens right after the surge,
-   while market memory of those highs is still fresh.
-3. TODAY's candle closes BELOW the previous day's LOW with volume
-   >= `min_breakdown_volume_ratio` x 20-day average  -> momentum loss.
-4. Today's close must be >= `min_drop_percent` below previous low
-   (filters trivial tick-below-low noise like -0.18%).
-5. The EMA breach is a ONE-TIME trend-weakness gate — but it does NOT
-   have to happen on the same candle as the breakdown. The screener
-   looks back up to `surge_recency_days` sessions to find a valid
-   breakdown candle (close below prev low + volume), then checks if
-   the 9-EMA was breached on THAT candle or any candle after it up
-   to today. Once the signal is saved, the EMA gate is skipped on all
-   future re-scans — trend damage is already confirmed.
-6. The SURGE HIGH (peak of the entire surge window) is the true
-   resistance ceiling — this is where original momentum exhausted.
-   Even after breakdown + partial recovery, this level rejects price
-   again. The CE strike is anchored above this level.
-7. When price rallies back within `price_proximity_percent` of the
-   surge high -> CE premium is elevated -> SELL CE above that
-   resistance. Theta decay + failed retest = profit.
+Equity 9-EMA Screener & Fair Value 3% Strategy Platform
+======================================================
+100% Pure Equity Architecture:
+  - 9-EMA Breakout & Higher-High Confirmation Screener
+  - Aligned Fundamental Fair Value Valuation Engine (R²-weighted regressions)
+  - 3% Target Strategy (+3.0% Gain Target & 9-EMA Close Invalidation)
+  - Institutional Walk-Forward Historical Backtesting Engine
+  - Real-Time Signals & Portfolio Tracker
 """
 
-import os, json, time, random, asyncio, threading, uuid, io, math
+import os
+import json
+import asyncio
+from typing import Dict, List, Optional, Any, Literal
 from pathlib import Path
-from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
-
 import numpy as np
 import pandas as pd
-import pytz
-import requests
-import yfinance as yf
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Body
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, FileResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-# Sub-routers (Option Charts + SMA Screener)
-from option_charts_router import router as oc_router
-from sma_router import router as sma_router
-from ema9_backtest_router import router as ema9_backtest_router
-from fair_value_router import router as fv_router  # /api/fv/* endpoints
+from core.data_fetcher import (
+    load_ticker_registry,
+    get_tickers_list,
+    fetch_ticker_ohlcv,
+    normalize_ticker,
+    clean_ohlcv,
+    HistoryUnavailableError,
+)
+from core.fair_value import compute_fair_value, batch_enrich_fair_value, get_cached_fair_value
+from core.screener import run_ema9_screener, analyze_ticker_ema9
+from core.strategy import compute_trend, indicator_frame
+from core.backtest import run_equity_backtest
+from core.duration_backtest import run_duration_backtest
+from core.swing_reversal import analyze_stock_swing_reversal, scan_swing_reversals
+from core.signals import (
+    load_signals,
+    save_signals,
+    add_or_update_signal,
+    delete_signal,
+    clear_signals,
+    refresh_active_signals,
+    get_signals_summary,
+)
+from core.scan_jobs import router as scan_jobs_router, register_job_handler
 
-# ADD THIS:
-from backtest import router as bt_router
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+CONFIG_FILE = BASE_DIR / "config.json"
+STATIC_DIR.mkdir(exist_ok=True)
 
-from ema9_router import router as ema9_router
-from ema9 import router as ema9
-# NOTE: fv_router import REMOVED — was overwriting fair_value_router above
-
-from chartink_router import router as chartink_router  # /api/chartink/* endpoints
-from chartink_watcher import (
-    router as chartink_watch_router,
-    start_chartink_scheduler,
-)  # /api/chartink-screener/* endpoints — auto-poll every 5 min
-# ─── Near-Support router (multi-touch horizontal support detector) ───────
-# Lives alongside the 9-EMA pipeline — same stocks can appear in BOTH lists.
-# Endpoints: /api/near-support/{scan,results,scan-now,export,health}
-from near_support_router import (
-    router as near_support_router,            # /api/near-support/* endpoints
-    start_near_support_scheduler,             # auto-poll every 5 min
-    stop_near_support_scheduler,              # graceful shutdown
+app = FastAPI(
+    title="Equity 9-EMA & Fair Value 3% Screener",
+    description="High-precision equity momentum & valuation trading system",
+    version="2.0.0",
 )
 
-# ⬇️⬇️⬇️ ADD THIS LINE HERE ⬇️⬇️⬇️
-from ml_service.ml_bridge import push_signals_to_ml, enrich_signal_with_ml
-
-BASE_DIR = Path(__file__).parent
-
-# ─────────────────────────────────────────────────────────────
-#  CONSTANTS
-# ─────────────────────────────────────────────────────────────
-TICKERS_FILE   = "tickers.csv"
-CONFIG_FILE    = "config.json"
-SIGNALS_FILE   = "signals.json"
-PROXIMITY_FILE = "proximity_alerts.json"
-SCAN_LOG_FILE  = "scan_log.json"
-TRACKER_FILE        = "strike_tracker.json"
-PREMIUM_ZONE_FILE   = "premium_zone.json"
-PNL_TRACKER_FILE    = "pnl_tracker.json"
-# Paper-trading log for Chartink Prime Target stocks. Each trade records
-# entry/exit prices, dates, target %, days held, and P&L. Survives server
-# restarts because it's a plain JSON file written via _wj (atomic write).
-TRADE_LOG_FILE      = "trade_log.json"
-# Fundamental filter cache (Piotroski-lite 5-check score per ticker).
-# Refreshed on-demand via the Fundamentals tab → "Refresh Now" button.
-# Stores one entry per ticker with raw yfinance metrics + computed score.
-FUNDAMENTALS_CACHE_FILE = "fundamentals_cache.json"
-
-IST = pytz.timezone("Asia/Kolkata")
-
-NSE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-    ),
-    "Accept":          "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer":         "https://www.nseindia.com/option-chain",
-    "Sec-Fetch-Site":  "same-origin",
-    "Sec-Fetch-Mode":  "cors",
-    "Connection":      "keep-alive",
-}
-
-_nse_session:         Optional[requests.Session] = None
-_nse_session_created: Optional[datetime]         = None
-_nse_lock = threading.Lock()
-NSE_SESSION_TTL_SECS = 25 * 60   # proactive refresh after 25 min
-
-# ─────────────────────────────────────────────────────────────
-#  JOB MANAGEMENT
-# ─────────────────────────────────────────────────────────────
-jobs: Dict[str, Dict] = {}
-jobs_lock = threading.Lock()
-
-def _prune_old_jobs():
-    """Drop completed jobs older than 2 hours to prevent memory growth."""
-    cutoff = datetime.now(IST) - timedelta(hours=2)
-    with jobs_lock:
-        stale = [
-            jid for jid, j in jobs.items()
-            if j.get("status") in ("done", "error") and j.get("created_at")
-            and datetime.strptime(j["created_at"], "%Y-%m-%d %H:%M:%S")
-               .replace(tzinfo=IST) < cutoff
-        ]
-        for jid in stale:
-            del jobs[jid]
-
-def create_job() -> str:
-    _prune_old_jobs()
-    job_id = str(uuid.uuid4())
-    with jobs_lock:
-        jobs[job_id] = {
-            "status":         "running",
-            "progress":       0,
-            "total":          0,
-            "current_ticker": "",
-            "logs":           [],
-            "result":         [],
-            "created_at":     now_ist_str(),
-        }
-    return job_id
-
-def job_log(job_id: str, msg: str, level: str = "info"):
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["logs"].append({
-                "time":  datetime.now(IST).strftime("%H:%M:%S"),
-                "msg":   msg,
-                "level": level,
-            })
-
-def job_progress(job_id: str, current: int, total: int, ticker: str):
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["progress"]       = current
-            jobs[job_id]["total"]          = total
-            jobs[job_id]["current_ticker"] = ticker
-
-def job_done(job_id: str, result: list, status: str = "done"):
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["status"] = status
-            jobs[job_id]["result"] = result
-
-# ─────────────────────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────────────────────
-DEFAULT_CONFIG = {
-    # Surge detection
-    "lookback_days":               30,
-    "min_gain_percent":            20.0,
-    "min_green_candles":           3,
-    "surge_recency_days":          5,      # surge_end must be within N trading days of today
-    # Surge gain calculation — High-based with wick filter
-    # The gain is computed from scan_closes[start] to the peak High in the window,
-    # BUT only if the candle's close is within `surge_wick_filter_pct` of that High.
-    # If the close is far below the High (long upper wick / intraday bubble), the
-    # close price is used instead so inflated wick gains don't qualify the window.
-    # surge_max_gain_pct: cap the gain at this value to filter out bubble/circuit
-    # stocks where the High reflects a manipulated or circuit-limit spike (>100%
-    # gains in a few candles are almost always bubble territory for CE-selling).
-    "surge_wick_filter_pct":       3.0,    # close must be within 3% of High to use High
-    "surge_max_gain_pct":          100.0,  # skip windows where gain > this % (bubble guard)
-    # Breakdown (momentum loss) candle
-    "min_drop_percent":            0.5,    # must close this % below prev low (not just a tick)
-    "min_breakdown_volume_ratio":  1.2,    # breakdown volume / 20d avg volume
-    # Trend filter
-    "ema_period":                  9,
-    "ema_filter_enabled":          True,   # breakdown close must be below EMA
-    # Sell zone
-    "price_proximity_percent":     2.0,    # within X% below yesterday_high = sell zone
-    # CE option filter
-    "ce_above_historical_high":    True,
-    "ce_history_days":             30,
-    # Signal freshness
-    "max_signal_age_days":         10,     # auto-prune signals older than N days (increased from 5 so Gate-2 confirmation has time to land)
-    # Auto scan
-    "auto_scan_enabled":           True,
-    "auto_scan_interval_min":      15,
-    "market_hours_only":           True,
-    # Previous-Pullup-High filter (Check 1)
-    # Finds the highest high in the window BEFORE the current surge/breakdown period.
-    # That level = the "last pullup high" = prior resistance the stock previously peaked at.
-    # If current price is at/above that level, the stock has broken out to new highs
-    # (bullish momentum intact) — selling CE is risky → SKIP.
-    #
-    # Example: HINDALCO Jan 29 2026 high ~985.  If current price >= 985 × 0.995,
-    # the stock is above its prior peak → skip.
-    #
-    # Window: (today - prev_high_lookback_days)  to  (today - prev_high_exclude_recent_days)
-    # The "exclude recent" gap ensures the current surge itself is NOT counted as the prior high.
-    "prev_high_filter_enabled":      False,
-    "prev_high_lookback_days":       120,    # how far back the prior-high window starts
-    "prev_high_exclude_recent_days": 30,     # exclude last N days (= current surge window); increased from 20 so the surge itself never bleeds into the prior-high window
-    "prev_high_buffer_pct":          2.0,    # if price >= prior_high*(1-buffer%), skip ticker; widened from 0.5% — was too tight for valid post-breakdown retests
-    # Bear Call Spread (Check 2)
-    # After finding the short CE, we also find a buy-leg N intervals higher
-    # to cap max loss.  Set to 0 to use a single short CE only.
-    "bear_call_spread_width_intervals": 1,   # 1 = buy the very next strike above short CE
-    # Telegram
-    "telegram_bot_token":          "",
-    "telegram_chat_id":            "",
-    # Premium Sell Zone tab
-    # Minimum live-volume / 20d-avg-volume ratio required to flag a stock
-    # as having a "volume surge" in the Premium Zone scan.
-    "premium_min_vol_surge":       1.5,
-    # How many OTM strikes above ATM to include in the option ladder
-    "premium_otm_depth":           3,
-    # Lifetime High filter — skip stocks where current price is at/near 52-week high
-    # (price at new lifetime high = breakout mode, not a retest → CE selling is risky)
-    "lifetime_high_filter_enabled": False,
-    "lifetime_high_lookback_days":  252,   # ~1 trading year
-    "lifetime_high_buffer_pct":     1.0,   # skip if price >= 52w_high * (1 - buffer%)
-    # ── Options Processing Master Toggle ──────────────────────────────────────
-    # When False, fetch_option_chain() short-circuits immediately and returns
-    # (None, "options_disabled_by_user") without hitting NSE. The auto-scheduler
-    # still runs every N minutes, but the entire NSE option-chain path is
-    # skipped, freeing up the GIL + HTTP pool for Chartink Live Feed and
-    # yfinance downloads. This is the kill-switch the user requested.
-    "options_processing_enabled":  True,
-    # ── Prime Target FV Gap Tolerance ─────────────────────────────────────────
-    # How much overvaluation (in %) is tolerated when classifying a ticker as a
-    # Prime Target. 0.0 = strict undervalued only (current_price < fair_value).
-    # 10.0 = allow tickers up to 10% overvalued (gap_to_fair_pct >= -10) to
-    # still be classified as Prime, capturing slightly-overvalued uptrending
-    # stocks that the user wants to track. Read by ema9_router._run_screen_pipeline
-    # and ema9_router.ema9_quick_scan via _load_prime_fv_gap_pct_from_config().
-    "ema9_prime_fv_gap_pct":       0.0,
-    # ── Pullback-from-Previous-High (entry-quality filter) ────────────────────
-    # Live screener + Chartink watcher annotation/filter. For every breakout
-    # signal, the backend looks back `ema9_pullback_lookback_days` bars before
-    # the breakout candle, finds the highest High in that window (= "prior
-    # high"), and computes how far the entry price has pulled back from it:
-    #   pullback_dist_pct = (prior_high - entry_price) / prior_high * 100
-    # A signal is flagged `is_pullback=True` iff pullback_dist_pct >=
-    # `ema9_pullback_threshold_pct`. When `ema9_filter_pullback=True`, signals
-    # that don't meet the threshold are DROPPED from prime_targets/other_signals
-    # (they go into filtered_by_pullback instead). When False (default), every
-    # signal keeps the annotation but none are filtered — user can sort/filter
-    # visually in the UI.
-    #
-    # Read by ema9_router._process_ticker_df + _run_screen_pipeline on every
-    # call, so changes take effect immediately (no server restart needed).
-    # Chartink watcher inherits these via _run_screen_pipeline.
-    "ema9_pullback_lookback_days": 60,      # window to find the prior high (60 ≈ 3 months)
-    "ema9_pullback_threshold_pct": 10.0,    # min % pullback required (10% = stock ≥10% below prior high)
-    "ema9_filter_pullback":        False,   # when True, drop signals that don't meet the pullback threshold
-    # ── Volatility-Adjusted Target (per-signal target_price from ATR) ──────────
-    # When ema9_vol_target_mode="atr", the live screener computes each signal's
-    # target_price from ATR instead of a flat 3%:
-    #   effective_target_pct = clamp(
-    #     ema9_vol_target_multiplier × ATR_at_entry / entry_price × 100,
-    #     ema9_vol_target_floor_pct, ema9_vol_target_cap_pct
-    #   )
-    # This adapts the target to each stock's volatility — high-vol stocks get
-    # larger targets (don't exit too early on a 5% ATR stock), low-vol stocks
-    # get smaller targets (don't wait forever for an unreachable 3% on a 1%
-    # ATR stock). When mode="fixed" (default), uses flat 3% (legacy behavior).
-    #
-    # Read by ema9_router._process_ticker_df + _run_screen_pipeline on every
-    # call, so changes take effect immediately (no server restart needed).
-    # Chartink watcher inherits these via _run_screen_pipeline.
-    "ema9_vol_target_mode":        "fixed", # "fixed" (legacy 3%) | "atr" (ATR-derived per signal)
-    "ema9_vol_target_atr_period":  14,      # ATR lookback (standard 14 days)
-    "ema9_vol_target_multiplier":  1.5,     # target = multiplier × ATR/price × 100
-    "ema9_vol_target_floor_pct":   2.0,     # min target % (prevents trivial 0.5% targets)
-    "ema9_vol_target_cap_pct":     8.0,     # max target % (prevents absurd 25% targets)
-    # ── Require Uptrend (SMA50) filter ────────────────────────────────────────
-    # When True (default), the live screener + Chartink watcher REJECT any 9EMA
-    # crossover signal where the current Close is ≤ the 50-day SMA. This filters
-    # out breakouts that happen in a downtrend (likely to fail). When False,
-    # EVERY 9EMA crossover is accepted regardless of SMA50 — useful when you
-    # suspect valid signals are being missed because the stock is recovering
-    # from a deeper correction (Close still below SMA50 but momentum turning).
-    #
-    # Read by ema9_router._run_screen_pipeline via _load_require_uptrend_from_config()
-    # on every call, so changes take effect immediately (no server restart).
-    # Chartink watcher inherits this via _run_screen_pipeline.
-    "ema9_require_uptrend":        True,
-    # ── Momentum Sweep (Chartink Live Feed) ───────────────────────────────────
-    # Catches stocks ALREADY above 9EMA making higher-highs with intact
-    # HH-LL structure (Close > prev day's Low). These are momentum-
-    # continuation candidates for a quick 3% target. Shown in a separate
-    # table on the Chartink panel. Independent of fresh-crossover signals.
-    # Read by ema9_router._run_screen_pipeline via _load_momentum_sweep_*.
-    "ema9_momentum_sweep_enabled":         True,    # master toggle
-    "ema9_momentum_sweep_min_ema9_dist_pct": 0.5,   # filter: not flat on EMA
-    "ema9_momentum_sweep_max_ema9_dist_pct": 15.0,  # filter: not extended (loose for momentum names)
-    "ema9_momentum_sweep_target_pct":      3.0,    # target % for trade plan
-    # ── Chartink Live Feed Master Toggle ──────────────────────────────────────
-    # When False, the Chartink auto-polling scheduler does NOT start on server
-    # boot, the /api/chartink-screener/scan-now endpoint rejects requests, the
-    # frontend stops its 5-min polling timer, AND send_telegram() is suppressed
-    # (secondary kill-switch alongside the Options toggle). This gives the user
-    # a single "quiet time" switch for everything Chartink-related. Persisted
-    # in config.json so it survives server restarts.
-    "chartink_feed_enabled":       True,
-    # ── Near-Support enrichment for the Chartink Live Feed ─────────────
-    # When True (default), every signal returned by _run_screen_pipeline
-    # is enriched with multi-touch horizontal support detection fields
-    # (near_support, near_support_level, near_support_touches, ...).
-    # The Chartink tab UI uses these to show the 🎯 column + dedicated
-    # "NEAR SUPPORT IN CHARTINK FEED" section + filter toggle.
-    # Set to False to disable the enrichment (saves ~3-5s per scan when
-    # you don't care about support levels).
-    "chartink_enrich_near_support": True,
-}
-
-def load_config() -> Dict:
-    cfg = DEFAULT_CONFIG.copy()
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE) as f:
-            cfg.update(json.load(f))
-    return cfg
-
-def save_config(cfg: Dict):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
-
-# ─────────────────────────────────────────────────────────────
-#  PERSISTENCE
-# ─────────────────────────────────────────────────────────────
-def _rj(path: str, default):
-    try:
-        if os.path.exists(path):
-            with open(path) as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return default
-
-def _wj(path: str, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-load_signals   = lambda: _rj(SIGNALS_FILE, [])
-save_signals   = lambda d: _wj(SIGNALS_FILE, d)
-load_proximity = lambda: _rj(PROXIMITY_FILE, [])
-save_proximity = lambda d: _wj(PROXIMITY_FILE, d)
-load_scan_log  = lambda: _rj(SCAN_LOG_FILE, [])
-save_scan_log  = lambda d: _wj(SCAN_LOG_FILE, d)
-load_premium_zone  = lambda: _rj(PREMIUM_ZONE_FILE, [])
-save_premium_zone  = lambda d: _wj(PREMIUM_ZONE_FILE, d)
-load_pnl_tracker   = lambda: _rj(PNL_TRACKER_FILE, [])
-save_pnl_tracker   = lambda d: _wj(PNL_TRACKER_FILE, d)
-# Trade Log persistence (paper-trading journal for Chartink Prime targets).
-# Stored as { "trades": [ {...}, ... ] } so we can attach metadata later
-# (e.g., schema version, last_updated) without breaking existing reads.
-load_trade_log     = lambda: _rj(TRADE_LOG_FILE, {"trades": []})
-save_trade_log     = lambda d: _wj(TRADE_LOG_FILE, d)
-# Fundamentals cache: { "last_run_at": "...", "total": N, "results": [...] }
-# Each result has: sr_no, security, symbol, metrics{...}, score, verdict, checks[]
-load_fundamentals  = lambda: _rj(FUNDAMENTALS_CACHE_FILE, {"results": []})
-save_fundamentals  = lambda d: _wj(FUNDAMENTALS_CACHE_FILE, d)
-
-# ─────────────────────────────────────────────────────────────
-#  TELEGRAM
-# ─────────────────────────────────────────────────────────────
-def send_telegram(token: str, chat_id: str, text: str):
-    # ── Hard kill-switch #1: never send Telegram when options processing is OFF ──
-    # The Options Processing toggle is the user's "leave me alone" switch.
-    # When it's off, the user explicitly does NOT want alerts — because the
-    # alerts would be missing option-ladder data anyway (fetch_option_chain
-    # is short-circuited). We check the toggle HERE, at the lowest level,
-    # so that any future code path that calls send_telegram() is also
-    # automatically silenced. This is the final backstop.
-    try:
-        if not is_options_processing_enabled():
-            print("[Telegram] SUPPRESSED — options processing is disabled (kill-switch #1)")
-            return
-    except Exception:
-        # If is_options_processing_enabled() somehow isn't defined yet (e.g.,
-        # during early module import), fall through and send normally —
-        # we'd rather over-alert than crash the scheduler thread.
-        pass
-
-    # ── Hard kill-switch #2: never send Telegram when Chartink feed is OFF ──
-    # The Chartink Live Feed toggle is the user's second "quiet time" switch.
-    # When Chartink is off, the user has signaled they don't want active
-    # monitoring right now — so we suppress ALL Telegram alerts, not just
-    # Chartink-derived ones. This gives the user two independent ways to
-    # silence alerts: Options OFF OR Chartink OFF = no Telegram.
-    try:
-        if not is_chartink_feed_enabled():
-            print("[Telegram] SUPPRESSED — Chartink Live Feed is disabled (kill-switch #2)")
-            return
-    except Exception:
-        pass
-
-    if not token or not chat_id:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    for i in range(0, len(text), 4096):
-        chunk = text[i:i+4096].strip()
-        try:
-            requests.post(url, json={"chat_id": chat_id, "text": chunk,
-                                     "parse_mode": "Markdown"}, timeout=10)
-        except Exception as e:
-            print(f"[Telegram] {e}")
-        time.sleep(0.3)
-
-# ─────────────────────────────────────────────────────────────
-#  TICKERS
-# ─────────────────────────────────────────────────────────────
-def load_tickers() -> List[str]:
-    try:
-        if os.path.exists(TICKERS_FILE):
-            df = pd.read_csv(TICKERS_FILE)
-            if "SYMBOL" in df.columns:
-                return [str(s).strip().upper() for s in df["SYMBOL"].dropna()]
-    except Exception:
-        pass
-    return ["HDFCBANK", "RELIANCE", "TCS", "INFY", "ICICIBANK"]
-
-# ─────────────────────────────────────────────────────────────
-#  UTILITY
-# ─────────────────────────────────────────────────────────────
-def is_market_open() -> bool:
-    now = datetime.now(IST)
-    if now.weekday() >= 5:
-        return False
-    o = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    c = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return o <= now <= c
-
-def now_ist_str() -> str:
-    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-
-def compute_ema(values: np.ndarray, period: int) -> np.ndarray:
-    """EMA via pandas ewm — matches standard charting tools."""
-    return pd.Series(values, dtype=float).ewm(span=period, adjust=False).mean().values
-
-
-# ─────────────────────────────────────────────────────────────
-#  IMPLIED VOLATILITY (Black-Scholes Newton-Raphson)
-# ─────────────────────────────────────────────────────────────
-def _bs_call_price(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    """Black-Scholes European call price."""
-    if T <= 0 or sigma <= 0:
-        return max(S - K, 0.0)
-    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    d2 = d1 - sigma * math.sqrt(T)
-    from scipy.special import ndtr
-    return S * ndtr(d1) - K * math.exp(-r * T) * ndtr(d2)
-
-
-def _bs_vega(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    """Black-Scholes vega (dC/dσ)."""
-    if T <= 0 or sigma <= 0:
-        return 1e-8
-    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-    from scipy.special import ndtr
-    # pdf of standard normal
-    nd1 = math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi)
-    return S * nd1 * math.sqrt(T)
-
-
-def compute_iv(
-    spot: float,
-    strike: float,
-    ce_ltp: float,
-    expiry_str: str,          # "DD-Mon-YYYY"
-    risk_free_rate: float = 0.065,
-) -> Optional[float]:
-    """
-    Compute implied volatility (annualised, as a percentage) for a CE option
-    using Newton-Raphson on the Black-Scholes model.
-    Returns IV% (e.g. 32.5 for 32.5%) or None if it cannot be computed.
-    """
-    try:
-        if spot <= 0 or strike <= 0 or ce_ltp <= 0:
-            return None
-        expiry_dt = datetime.strptime(expiry_str, "%d-%b-%Y").date()
-        today     = date.today()
-        T = (expiry_dt - today).days / 365.0
-        if T <= 0:
-            return None
-
-        # Bounds check — intrinsic floor; can't back out IV if LTP < intrinsic
-        intrinsic = max(spot - strike, 0.0)
-        if ce_ltp <= intrinsic:
-            return None
-
-        # Newton-Raphson with fallback to bisection
-        sigma = 0.35  # initial guess 35%
-        for _ in range(100):
-            price = _bs_call_price(spot, strike, T, risk_free_rate, sigma)
-            vega  = _bs_vega(spot, strike, T, risk_free_rate, sigma)
-            diff  = price - ce_ltp
-            if abs(diff) < 1e-5:
-                break
-            if vega < 1e-8:
-                break
-            sigma -= diff / vega
-            sigma = max(0.001, min(sigma, 20.0))  # clamp 0.1% – 2000%
-
-        iv_pct = round(sigma * 100, 1)
-        return iv_pct if 1.0 <= iv_pct <= 500.0 else None
-    except Exception:
-        return None
-
-
-# ─────────────────────────────────────────────────────────────
-#  52-WEEK (LIFETIME) HIGH CHECK
-# ─────────────────────────────────────────────────────────────
-def get_lifetime_high(ticker: str, lookback_days: int = 252) -> Optional[float]:
-    """
-    Returns the highest intraday High over the past `lookback_days` calendar days.
-    Used to detect stocks trading at/near 52-week highs where CE selling is risky.
-    """
-    try:
-        end_dt   = date.today()
-        start_dt = end_dt - timedelta(days=lookback_days + 10)
-        hist = yf.Ticker(f"{ticker}.NS").history(
-            start=str(start_dt), end=str(end_dt), auto_adjust=True
-        )
-        if hist.empty or len(hist) < 5:
-            return None
-        return float(hist["High"].max())
-    except Exception as e:
-        print(f"[yf] Lifetime high error {ticker}: {e}")
-        return None
-
-# ─────────────────────────────────────────────────────────────
-#  NSE SESSION  (TTL-based proactive refresh)
-# ─────────────────────────────────────────────────────────────
-def get_nse_session() -> Optional[requests.Session]:
-    global _nse_session, _nse_session_created
-    with _nse_lock:
-        if _nse_session is not None and _nse_session_created is not None:
-            age = (datetime.now(IST) - _nse_session_created).total_seconds()
-            if age > NSE_SESSION_TTL_SECS:
-                print(f"[NSE] Session TTL exceeded ({age:.0f}s) — refreshing")
-                _nse_session         = None
-                _nse_session_created = None
-
-        if _nse_session is not None:
-            return _nse_session
-
-        s = requests.Session()
-        s.headers.update(NSE_HEADERS)
-        try:
-            s.get("https://www.nseindia.com/", timeout=12)
-            time.sleep(random.uniform(1.5, 2.5))
-            s.get("https://www.nseindia.com/option-chain", timeout=12)
-            time.sleep(random.uniform(2.0, 3.0))
-            _nse_session         = s
-            _nse_session_created = datetime.now(IST)
-            return s
-        except Exception as e:
-            print(f"[NSE] Session init failed: {e}")
-            return None
-
-def reset_nse_session():
-    global _nse_session, _nse_session_created
-    with _nse_lock:
-        _nse_session         = None
-        _nse_session_created = None
-
-# ─────────────────────────────────────────────────────────────
-#  NSE OPTION CHAIN
-# ─────────────────────────────────────────────────────────────
-
-# ─── Options Processing Master Switch ──────────────────────────────────────
-# In-memory mirror of cfg["options_processing_enabled"]. Read on EVERY call to
-# fetch_option_chain() so the toggle takes effect immediately when flipped via
-# /api/options/toggle — no scheduler restart needed.
-_OPTIONS_ENABLED: bool = True
-
-def _refresh_options_enabled_from_config() -> bool:
-    """Reload the in-memory flag from disk config. Returns the new value."""
-    global _OPTIONS_ENABLED
-    try:
-        _OPTIONS_ENABLED = bool(load_config().get("options_processing_enabled", True))
-    except Exception:
-        _OPTIONS_ENABLED = True
-    return _OPTIONS_ENABLED
-
-def is_options_processing_enabled() -> bool:
-    """Public accessor for other modules / endpoints."""
-    return _OPTIONS_ENABLED
-
-
-# ─── Chartink Live Feed Master Switch ──────────────────────────────────────
-# In-memory mirror of cfg["chartink_feed_enabled"]. Read on:
-#   • Server startup — to decide whether to call start_chartink_scheduler()
-#   • send_telegram() — secondary kill-switch (Chartink OFF → no Telegram)
-#   • /api/chartink-feed/toggle — to report current state
-# Toggled via PUT /api/chartink-feed/toggle which updates config.json AND
-# this flag immediately (no server restart needed). When toggled OFF at
-# runtime, we also try to call stop_chartink_scheduler() if the watcher
-# module exposes one — otherwise the scheduler keeps running but the
-# frontend stops polling and the results are ignored.
-_CHARTINK_FEED_ENABLED: bool = True
-
-def _refresh_chartink_feed_enabled_from_config() -> bool:
-    """Reload the in-memory Chartink flag from disk config. Returns the new value."""
-    global _CHARTINK_FEED_ENABLED
-    try:
-        _CHARTINK_FEED_ENABLED = bool(load_config().get("chartink_feed_enabled", True))
-    except Exception:
-        _CHARTINK_FEED_ENABLED = True
-    return _CHARTINK_FEED_ENABLED
-
-def is_chartink_feed_enabled() -> bool:
-    """Public accessor — used by send_telegram() and the toggle endpoints."""
-    return _CHARTINK_FEED_ENABLED
-
-
-def fetch_option_chain(ticker: str) -> Tuple[Optional[Dict], Optional[str]]:
-    # ── KILL-SWITCH: short-circuit NSE calls when user has disabled options ──
-    # This is the single chokepoint through which EVERY options-fetching path
-    # flows (find_best_strike, check_proximity_alerts, _do_refresh_ladders,
-    # scan_premium_zone_job). When disabled, all of them return None instantly
-    # with zero network I/O, freeing the scheduler thread + HTTP pool for
-    # Chartink Live Feed + yfinance downloads.
-    if not _OPTIONS_ENABLED:
-        return None, "options_disabled_by_user"
-
-    session = get_nse_session()
-    if session is None:
-        return None, None
-    try:
-        r = session.get(
-            f"https://www.nseindia.com/api/option-chain-contract-info?symbol={ticker}",
-            timeout=12,
-        )
-        if r.status_code in (429, 403):
-            reset_nse_session()
-            return None, None
-        if r.status_code != 200 or not r.text.strip().startswith("{"):
-            return None, None
-        d = r.json()
-        expiries = d.get("expiryDates", []) or d.get("records", {}).get("expiryDates", [])
-        if not expiries:
-            return None, None
-
-        # Skip nearest expiry if within 3 calendar days (high gamma risk)
-        today_dt      = date.today()
-        chosen_expiry = expiries[0]
-        try:
-            nearest_dt = datetime.strptime(expiries[0], "%d-%b-%Y").date()
-            if (nearest_dt - today_dt).days <= 3 and len(expiries) > 1:
-                chosen_expiry = expiries[1]
-                print(f"[NSE] {ticker}: nearest expiry {expiries[0]} too close "
-                      f"({(nearest_dt - today_dt).days}d) -> using {chosen_expiry}")
-        except Exception:
-            pass
-
-        expiry = chosen_expiry
-    except Exception as e:
-        print(f"[NSE] Expiry error {ticker}: {e}")
-        return None, None
-
-    time.sleep(random.uniform(1.0, 2.0))
-
-    try:
-        r2 = session.get(
-            f"https://www.nseindia.com/api/option-chain-v3"
-            f"?type=Equity&symbol={ticker}&expiry={expiry}",
-            timeout=15,
-        )
-        if r2.status_code in (429, 403):
-            reset_nse_session()
-            return None, None
-        if r2.status_code != 200 or not r2.text.strip().startswith("{"):
-            return None, None
-        records = r2.json().get("filtered", {}).get("data", [])
-        strike_map: Dict[float, Dict] = {}
-        for rec in records:
-            sp     = float(rec.get("strikePrice", 0))
-            ce     = rec.get("CE", {})
-            ltp    = ce.get("lastPrice", 0.0)
-            oi     = ce.get("openInterest", 0)
-            chg    = ce.get("change", None)
-            pchg   = ce.get("pChange", None)
-            prev   = ce.get("prevClose", None)
-            ce_iv  = ce.get("impliedVolatility", None)
-            high   = ce.get("high", None)        # intraday high of the CE premium
-            if sp > 0:
-                ltp_f  = float(ltp)
-                prev_f = float(prev) if prev is not None else None
-                high_f = float(high) if high is not None else None
-                chg_f  = float(chg)  if chg  is not None else (
-                             round(ltp_f - prev_f, 2) if prev_f is not None else None)
-                # pChange: prefer NSE value; fallback = compute from ltp/prev
-                if pchg is not None:
-                    pchg_f = round(float(pchg), 1)
-                elif prev_f and prev_f > 0 and ltp_f > 0:
-                    pchg_f = round((ltp_f - prev_f) / prev_f * 100, 1)
-                else:
-                    pchg_f = None
-                # High-based gain% — how much the CE surged from prev close to intraday high
-                # This captures the maximum premium spike even if LTP has since pulled back
-                if high_f is not None and prev_f and prev_f > 0 and high_f > 0:
-                    high_chg_pct_f = round((high_f - prev_f) / prev_f * 100, 1)
-                else:
-                    high_chg_pct_f = None
-                strike_map[sp] = {
-                    "CE_ltp":          ltp_f,
-                    "CE_high":         round(high_f, 2) if high_f is not None else None,
-                    "CE_oi":           int(oi),
-                    "CE_chg":          chg_f,
-                    "CE_chg_pct":      pchg_f,         # LTP-based gain%
-                    "CE_high_chg_pct": high_chg_pct_f, # High-based gain% (peak surge)
-                    "CE_prev":         round(prev_f, 2) if prev_f is not None else None,
-                    "CE_iv":           round(float(ce_iv), 1)  if ce_iv is not None else None,
-                }
-        return strike_map, expiry
-    except Exception as e:
-        print(f"[NSE] Option chain error {ticker}: {e}")
-        return None, None
-
-# ─────────────────────────────────────────────────────────────
-#  YFINANCE HELPERS
-# ─────────────────────────────────────────────────────────────
-def get_price_history(ticker: str, days: int) -> Optional[pd.DataFrame]:
-    try:
-        now_ist  = datetime.now(IST)
-        end_dt   = (now_ist + timedelta(days=1)).date()
-        start_dt = (now_ist - timedelta(days=days + 15)).date()
-        hist = yf.Ticker(f"{ticker}.NS").history(
-            start=str(start_dt), end=str(end_dt), auto_adjust=True
-        )
-        if hist.empty:
-            return None
-        if hist.index.tz is None:
-            hist.index = hist.index.tz_localize("UTC")
-        hist.index = hist.index.tz_convert(IST)
-        hist = hist.sort_index()
-        hist = hist[hist.index.date <= now_ist.date()]
-        return hist
-    except Exception as e:
-        print(f"[yf] History error {ticker}: {e}")
-        return None
-
-def get_current_price(ticker: str) -> Optional[float]:
-    try:
-        p = yf.Ticker(f"{ticker}.NS").fast_info.last_price
-        return float(p) if p else None
-    except Exception:
-        return None
-
-def get_previous_pullup_high(
-    ticker: str,
-    lookback_days: int = 120,
-    exclude_recent_days: int = 20,
-) -> Optional[float]:
-    """
-    Returns the highest intraday High in the "prior window":
-        from  (today - lookback_days)
-        to    (today - exclude_recent_days)
-
-    This captures the last significant pullup/swing high that the stock
-    reached BEFORE the current surge — the prior resistance ceiling.
-
-    The `exclude_recent_days` gap skips the recent surge/breakdown period
-    so the current move doesn't self-report as the "previous high."
-
-    Example — HINDALCO (as of May 2026):
-        exclude_recent_days = 20  →  window ends ~Apr 14
-        lookback_days       = 120 →  window starts ~Jan 5
-        Jan 29 peak (~985) falls inside this window → returned as prior high.
-        Current price ~1,042 >= 985 × 0.995 → filter fires → SKIP.
-    """
-    try:
-        end_dt   = date.today() - timedelta(days=exclude_recent_days)
-        start_dt = date.today() - timedelta(days=lookback_days)
-        if end_dt <= start_dt:
-            return None
-        hist = yf.Ticker(f"{ticker}.NS").history(
-            start=str(start_dt), end=str(end_dt), auto_adjust=True
-        )
-        if hist.empty or len(hist) < 3:
-            return None
-        return float(hist["High"].max())
-    except Exception as e:
-        print(f"[yf] Previous pullup high error {ticker}: {e}")
-        return None
-
-# ─────────────────────────────────────────────────────────────
-#  CE HISTORICAL HIGH
-# ─────────────────────────────────────────────────────────────
-def get_ce_historical_high(ticker: str, strike: float, expiry_str: str,
-                            days: int = 30) -> Tuple[Optional[float], int]:
-    try:
-        session = get_nse_session()
-        if session is None:
-            print(f"[{ticker}] NSE session is None")
-            return None, 0
-
-        expiry_dt = datetime.strptime(expiry_str, "%d-%b-%Y")
-        exp_nse   = expiry_dt.strftime("%d-%b-%Y")
-        year      = expiry_dt.year
-        end_dt    = date.today()
-        start_dt  = end_dt - timedelta(days=days + 5)
-
-        url = (
-            f"https://www.nseindia.com/api/historicalOR/foCPV"
-            f"?from={start_dt.strftime('%d-%m-%Y')}"
-            f"&to={end_dt.strftime('%d-%m-%Y')}"
-            f"&instrumentType=OPTSTK"
-            f"&symbol={ticker}"
-            f"&year={year}"
-            f"&expiryDate={exp_nse}"
-            f"&optionType=CE"
-            f"&strikePrice={int(strike)}"
-        )
-        print(f"\n{'='*60}")
-        # print(f"[{ticker}] NSE CE HIST URL:\n  {url}")
-        # print(f"  expiry_str received : {expiry_str!r}")
-        # print(f"  exp_nse formatted   : {exp_nse!r}")
-        # print(f"  year                : {year}")
-        # print(f"  strike (int)        : {int(strike)}")
-        # print(f"  date range          : {start_dt} -> {end_dt}")
-
-        time.sleep(random.uniform(1.0, 2.0))
-        r = session.get(url, timeout=15)
-
-        # print(f"[{ticker}] HTTP STATUS : {r.status_code}")
-        # print(f"[{ticker}] RESPONSE (first 500 chars):\n  {r.text[:500]!r}")
-
-        if r.status_code in (403, 429):
-            print(f"[{ticker}] Blocked ({r.status_code}) -- resetting session")
-            reset_nse_session()
-            return None, 1
-        if r.status_code != 200:
-            print(f"[{ticker}] Non-200 status: {r.status_code}")
-            return None, 1
-        if not r.text.strip().startswith("{"):
-            print(f"[{ticker}] Response is NOT JSON")
-            return None, 1
-
-        data = r.json()
-        # print(f"[{ticker}] TOP-LEVEL KEYS : {list(data.keys())}")
-
-        rows = (
-            data.get("data")
-            or data.get("Data")
-            or data.get("records", {}).get("data")
-            or []
-        )
-        # print(f"[{ticker}] ROWS COUNT : {len(rows)}")
-        # if rows:
-        #     print(f"[{ticker}] FIRST ROW KEYS : {list(rows[0].keys())}")
-        #     print(f"[{ticker}] FIRST ROW DATA : {rows[0]}")
-
-        if not rows:
-            print(f"[{ticker}] Empty rows -- API returned no historical data")
-            return None, 1
-
-        ltps = []
-        for row in rows:
-            val = (
-                row.get("FH_CLOSING_PRICE")
-                or row.get("FH_LAST_TRADED_PRICE")
-                or row.get("close")
-                or row.get("lastPrice")
-                or row.get("FH_TRADE_HIGH_PRICE")
-                or row.get("CH_CLOSING_PRICE")
-                or 0
-            )
-            try:
-                v = float(str(val).replace(",", ""))
-                if v > 0:
-                    ltps.append(v)
-            except (ValueError, TypeError):
-                continue
-
-        # print(f"[{ticker}] EXTRACTED LTPs : {ltps[:10]}{'...' if len(ltps)>10 else ''}")
-        if not ltps:
-            print(f"[{ticker}] No valid LTP values")
-            return None, 1
-
-        high = max(ltps)
-        print(f"[{ticker}] CE {days}d HIGH = Rs{high}")
-        print(f"{'='*60}\n")
-        return high, 1
-
-    except Exception as e:
-        import traceback
-        print(f"[{ticker}] EXCEPTION in get_ce_historical_high:")
-        traceback.print_exc()
-        return None, 0
-
-# ─────────────────────────────────────────────────────────────
-#  STRIKE SELECTION
-#  Anchored to yesterday_high (resistance ceiling), not today_close.
-#  We sell a CE that only goes ITM if price breaks above resistance.
-# ─────────────────────────────────────────────────────────────
-def nearest_round_strike_above(price: float, strike_map: Dict) -> Optional[float]:
-    liquid_above = {
-        s: data for s, data in strike_map.items()
-        if s > price and data["CE_ltp"] > 0
-    }
-    if not liquid_above:
-        above = [s for s in strike_map if s > price]
-        return min(above) if above else None
-    sorted_strikes = sorted(liquid_above.keys(), key=lambda s: s - price)
-    top3 = sorted_strikes[:3]
-    round_in_top3 = [s for s in top3 if int(s) % 50 == 0]
-    if round_in_top3:
-        return min(round_in_top3, key=lambda s: s - price)
-    return sorted_strikes[0]
-
-
-# ─────────────────────────────────────────────────────────────
-#  MATH-ONLY STRIKE HELPERS
-#  Used when we need a strike estimate WITHOUT an NSE option-chain
-#  call (e.g. when recomputing surge_high at Gate 2 confirmation).
-# ─────────────────────────────────────────────────────────────
-import math as _math
-
-def nse_strike_interval(price: float) -> float:
-    """NSE standard strike interval for a given stock price."""
-    if price < 250:   return 10
-    if price < 500:   return 20
-    if price < 1000:  return 50
-    if price < 2500:  return 100
-    if price < 5000:  return 200
-    return 500
-
-
-def nearest_otm_strike_math(surge_high: float) -> float:
-    """
-    Nearest strike STRICTLY ABOVE surge_high using NSE standard
-    intervals — no option-chain call required.
-    Mirrors backtest.py::nearest_otm_strike().
-    """
-    interval = nse_strike_interval(surge_high)
-    return _math.ceil(surge_high / interval) * interval
-
-# ─────────────────────────────────────────────────────────────
-#  SURGE CONTINUITY CHECK
-#
-#  A surge window [start, end] is "continuous" when every red
-#  candle (close < open) inside it closes AT OR ABOVE the
-#  previous candle's low.  This preserves the higher-low
-#  structure while tolerating healthy pullback candles.
-#
-#  A red candle that closes BELOW the previous candle's low
-#  is a real structural break and disqualifies the window.
-# ─────────────────────────────────────────────────────────────
-def check_surge_continuity(
-    closes: np.ndarray,
-    opens:  np.ndarray,
-    lows:   np.ndarray,
-    start:  int,
-    end:    int,
-) -> Tuple[bool, int, int]:
-    """
-    Returns (is_continuous, allowed_red_count, green_count).
-    is_continuous=False means a red candle broke the prior low.
-    """
-    green_count       = 0
-    allowed_red_count = 0
-
-    for i in range(start, end + 1):
-        is_green = closes[i] > opens[i]
-        if is_green:
-            green_count += 1
-        else:
-            # Red candle -- check higher-low structure
-            if i > start and closes[i] < lows[i - 1]:
-                # Closed below previous candle's low = structural break
-                return False, allowed_red_count, green_count
-            allowed_red_count += 1
-
-    return True, allowed_red_count, green_count
-
-
-# ─────────────────────────────────────────────────────────────
-#  SCREENING -- STEP 1
-# ─────────────────────────────────────────────────────────────
-def check_surge_and_loss(ticker: str, cfg: Dict, job_id: str = "") -> Optional[Dict]:
-    hist = get_price_history(ticker, cfg["lookback_days"])
-    if hist is None or len(hist) < cfg["min_green_candles"] + 5:
-        return None
-
-    hist   = hist.sort_index()
-    closes = hist["Close"].values.copy()
-    highs  = hist["High"].values.copy()
-    lows   = hist["Low"].values.copy()
-    opens  = hist["Open"].values.copy()
-    vols   = hist["Volume"].values.copy()
-    dates  = hist.index
-
-    if len(closes) < 3:
-        return None
-
-    # Inject live price into today's close (and high) during market hours
-    live_price = get_current_price(ticker)
-    if live_price is not None:
-        closes[-1] = live_price
-        if live_price > highs[-1]:
-            highs[-1] = live_price
-
-    # ── CHECK 1: Previous-Pullup-High filter ─────────────────────────────────
-    # Goal: skip tickers where the current price has already surpassed (or is
-    # sitting right at) the LAST significant swing/pullup high — the prior
-    # resistance ceiling formed BEFORE the current surge.
-    #
-    # Why this matters: if price > prior high, the stock is in breakout mode.
-    # There is no overhead resistance to reject price → CE selling is risky.
-    #
-    # The filter looks at a window BEFORE the recent surge period so the
-    # current move is never mis-counted as the "previous high."
-    #
-    # Window layout (example with defaults):
-    #   ├── today-120d ──────── prior-high window ──────── today-20d ──┤ today
-    #                           ↑ max(High) here = prev_pullup_high
-    #   └─── current surge + breakdown ─── (last ~20d, excluded) ─────┘
-    lth_enabled: bool           = cfg.get("prev_high_filter_enabled", True)
-    lifetime_high: Optional[float] = None   # populated below; reused in candidate dict
-    if lth_enabled:
-        lth_lookback = int(cfg.get("prev_high_lookback_days",       120))
-        lth_exclude  = int(cfg.get("prev_high_exclude_recent_days",  30))
-        lth_buffer   = float(cfg.get("prev_high_buffer_pct",          2.0))
-        cur_price_for_lth = float(live_price if live_price is not None else closes[-1])
-
-        lifetime_high = get_previous_pullup_high(ticker, lth_lookback, lth_exclude)
-        if lifetime_high is not None and lifetime_high > 0:
-            lth_threshold = lifetime_high * (1.0 - lth_buffer / 100.0)
-            if cur_price_for_lth >= lth_threshold:
-                msg = (
-                    f"{ticker} SKIP (Prev-Pullup-High): "
-                    f"price Rs{cur_price_for_lth:.2f} >= threshold Rs{lth_threshold:.2f} "
-                    f"(prev high Rs{lifetime_high:.2f} from "
-                    f"{lth_exclude}-{lth_lookback}d window, buffer {lth_buffer}%)"
-                )
-                # print(f"[FILTER] {msg}")
-                if job_id:
-                    job_log(job_id, msg, "fail")
-                return None
-            if job_id:
-                dist_from_prev = (lifetime_high - cur_price_for_lth) / lifetime_high * 100
-                job_log(
-                    job_id,
-                    f"{ticker} Prev-Pullup-High OK: "
-                    f"price Rs{cur_price_for_lth:.2f} is {dist_from_prev:.1f}% "
-                    f"below prior high Rs{lifetime_high:.2f} "
-                    f"({lth_exclude}-{lth_lookback}d window)",
-                    "info",
-                )
-    # ── CHECK 1b: 52-Week (Lifetime) High filter ─────────────────────────────
-    # Skip tickers where current price is at or near the 52-week high.
-    # A stock at its annual high is in breakout mode — no overhead resistance
-    # to reject price → CE selling thesis doesn't apply.
-    lth52_enabled = cfg.get("lifetime_high_filter_enabled", True)
-    lifetime_52w_high: Optional[float] = None
-    if lth52_enabled:
-        lth52_lookback = int(cfg.get("lifetime_high_lookback_days", 252))
-        lth52_buffer   = float(cfg.get("lifetime_high_buffer_pct", 1.0))
-        cur_p          = float(live_price if live_price is not None else closes[-1])
-
-        lifetime_52w_high = get_lifetime_high(ticker, lth52_lookback)
-        if lifetime_52w_high is not None and lifetime_52w_high > 0:
-            lth52_threshold = lifetime_52w_high * (1.0 - lth52_buffer / 100.0)
-            if cur_p >= lth52_threshold:
-                msg = (
-                    f"{ticker} SKIP (52W-High): "
-                    f"price Rs{cur_p:.2f} >= {lth52_threshold:.2f} "
-                    f"(52w high Rs{lifetime_52w_high:.2f}, buffer {lth52_buffer}%) — breakout mode"
-                )
-                # print(f"[FILTER] {msg}")
-                if job_id:
-                    job_log(job_id, msg, "fail")
-                return None
-            if job_id:
-                dist52 = (lifetime_52w_high - cur_p) / lifetime_52w_high * 100
-                job_log(
-                    job_id,
-                    f"{ticker} 52W-High OK: price Rs{cur_p:.2f} is {dist52:.1f}% "
-                    f"below 52w high Rs{lifetime_52w_high:.2f}",
-                    "info",
-                )
-    ema_period  = int(cfg.get("ema_period", 9))
-    ema_enabled = cfg.get("ema_filter_enabled", True)
-    ema_values  = compute_ema(closes, ema_period)
-
-    # ── CONDITIONS 1-4: Scan backwards for breakdown candle ───────────────────
-    # The breakdown candle and the EMA breach do NOT have to occur on the same
-    # day. We look back up to `surge_recency_days` candles to find a candle
-    # that:
-    #   (a) closed below the prior candle's low by >= min_drop_percent    [C1+C2]
-    #   (b) had volume >= min_breakdown_volume_ratio x 20d avg            [C3]
-    # Once a valid breakdown candle is found, we check whether EMA was
-    # breached on THAT candle OR on any candle between it and today.       [C4]
-    #
-    # Example — CDSL 21-22 Apr 2026:
-    #   21 Apr: closes below prev low + high volume  ← breakdown candle (Gate 1)
-    #   22 Apr: closes below 9-EMA with volume       ← Gate 2 confirmed separately
-    #   Today:  price rallies back → sell zone fires  ← Gate 3 proximity
-    #
-    # Gate 2 (EMA+volume after breakdown) is tracked per-signal by
-    # update_sell_zone_gates() and is NOT required at signal creation time.
-
-    min_drop      = cfg.get("min_drop_percent", 0.5)
-    min_vol_ratio = cfg.get("min_breakdown_volume_ratio", 1.2)
-    lookback_bd   = int(cfg.get("surge_recency_days", 5))  # how far back to search
-
-    breakdown_idx    = None   # index of the confirmed breakdown candle
-    today_close      = float(closes[-1])
-    yesterday_high   = None
-    yesterday_low    = None
-    yesterday_close  = None
-    drop_pct         = None
-    breakdown_vol    = None
-    avg_vol_20d      = None
-    volume_ratio     = None
-    ema_at_detection = None
-    below_ema        = False
-
-    # Search from most recent candle backwards (index -1 = today, -2 = yesterday …)
-    for offset in range(1, min(lookback_bd + 2, len(closes))):
-        bd_idx    = len(closes) - offset          # candidate breakdown candle
-        prev_idx  = bd_idx - 1                    # candle before it
-
-        if prev_idx < 1:
-            break
-
-        bd_close  = float(closes[bd_idx])
-        prev_low  = float(lows[prev_idx])
-        prev_high = float(highs[prev_idx])
-        prev_close= float(closes[prev_idx])
-
-        # C1: must close below prior candle's low
-        if bd_close >= prev_low:
-            continue
-
-        # C2: drop must be meaningful
-        _drop = (prev_low - bd_close) / prev_low * 100
-        if _drop < min_drop:
-            continue
-
-        # C3: volume check
-        _bd_vol      = float(vols[bd_idx]) if vols[bd_idx] > 0 else 0.0
-        _vol_window  = vols[max(0, bd_idx - 20):bd_idx]
-        _avg_vol     = float(_vol_window.mean()) if len(_vol_window) > 0 else 0.0
-        _vol_ratio   = (_bd_vol / _avg_vol) if _avg_vol > 0 else 0.0
-
-        if _vol_ratio < min_vol_ratio:
-            continue
-
-        # EMA value at breakdown for display/reference (Gate 2 EMA+volume check
-        # is handled separately by update_sell_zone_gates after signal creation).
-        _ema_at = float(ema_values[bd_idx])
-
-        # ── Valid breakdown found ─────────────────────────────────────────────
-        breakdown_idx    = bd_idx
-        yesterday_high   = prev_high
-        yesterday_low    = prev_low
-        yesterday_close  = prev_close
-        drop_pct         = _drop
-        breakdown_vol    = _bd_vol
-        avg_vol_20d      = _avg_vol
-        volume_ratio     = _vol_ratio
-        ema_at_detection = _ema_at
-        below_ema        = bool(closes[bd_idx] < ema_values[bd_idx])
-
-        if job_id:
-            bd_date = dates[bd_idx].strftime("%Y-%m-%d")
-            job_log(job_id,
-                f"{ticker} breakdown candle: {bd_date}  "
-                f"close Rs{closes[bd_idx]:.2f}  prev_low Rs{prev_low:.2f}  "
-                f"drop={drop_pct:.2f}%  vol={volume_ratio:.2f}x",
-                "info")
-        break   # use the most recent valid breakdown
-
-    if breakdown_idx is None:
-        msg = f"{ticker} no valid breakdown candle in last {lookback_bd} sessions"
-        # print(f"[FILTER] {msg}")
-        if job_id:
-            job_log(job_id, msg, "fail")
-        return None
-
-    # ── CONDITION 5: Continuous surge ending recently ──────────────────────
-    min_gain     = cfg["min_gain_percent"]
-    min_green    = cfg["min_green_candles"]
-    recency_days = int(cfg.get("surge_recency_days", 5))
-    wick_filter_pct = float(cfg.get("surge_wick_filter_pct", 3.0))
-    max_gain_pct    = float(cfg.get("surge_max_gain_pct", 100.0))
-
-    # Operate on candles BEFORE the breakdown candle (exclude breakdown onward).
-    # breakdown_idx points to the breakdown candle; surge must end before it.
-    scan_closes = closes[:breakdown_idx]
-    scan_opens  = opens[:breakdown_idx]
-    scan_lows   = lows[:breakdown_idx]
-    scan_highs  = highs[:breakdown_idx]   # pre-breakdown highs only (excludes live-price injection)
-    scan_dates  = dates[:breakdown_idx]
-    n           = len(scan_closes)
-
-    if n < min_green + 2:
-        return None
-
-    # Surge end must be within recency_days sessions BEFORE the breakdown candle
-    min_end_idx  = n - recency_days
-    window_min   = max(min_green + 1, 3)
-
-    best_gain   = 0.0
-    best_greens = 0
-    best_reds   = 0
-    best_window = None
-
-    for wsize in range(window_min, n + 1):
-        for start in range(0, n - wsize + 1):
-            end = start + wsize - 1
-
-            # Enforce recency
-            if end < min_end_idx:
-                continue
-
-            # ── High-based gain with wick filter ─────────────────────────
-            # Find the candle with the highest High in the window.
-            # If that candle's close is within wick_filter_pct of its High,
-            # the surge genuinely closed near the peak — use the High.
-            # If not (long upper wick / intraday bubble), fall back to the
-            # close so bubble spikes don't inflate the gain calculation.
-            peak_idx   = start + int(np.argmax(scan_highs[start:end + 1]))
-            peak_high  = float(scan_highs[peak_idx])
-            peak_close = float(scan_closes[peak_idx])
-            wick_threshold = peak_high * (1.0 - wick_filter_pct / 100.0)
-            effective_peak = peak_high if peak_close >= wick_threshold else peak_close
-
-            net_gain = ((effective_peak - scan_closes[start]) / scan_closes[start]) * 100
-            if net_gain < min_gain:
-                continue
-
-            # ── Bubble / circuit-limit guard ─────────────────────────────
-            # A >100% gain in a short window is almost always a manipulated
-            # spike, SME circuit stock, or news-driven bubble — not the kind
-            # of organised momentum surge where CE-selling makes sense.
-            # Skip the window; the stock will still be evaluated on other
-            # sub-windows that may have a sane gain.
-            if net_gain > max_gain_pct:
-                if job_id:
-                    job_log(job_id,
-                        f"{ticker} SKIP window [{start},{end}]: "
-                        f"gain {net_gain:.1f}% > max {max_gain_pct:.0f}% (bubble guard)",
-                        "warn")
-                continue
-
-            # Continuity check: red candles allowed only if higher-low holds
-            is_cont, red_count, green_count = check_surge_continuity(
-                scan_closes, scan_opens, scan_lows, start, end
-            )
-            if not is_cont or green_count < min_green:
-                continue
-
-            # Keep best by gain; prefer more recent end on tie
-            prev_end = best_window[1] if best_window else -1
-            if net_gain > best_gain or (net_gain == best_gain and end > prev_end):
-                best_gain   = net_gain
-                best_greens = green_count
-                best_reds   = red_count
-                best_window = (start, end)
-
-    if best_window is None or best_gain < min_gain:
-        msg = (
-            f"{ticker} no continuous surge >={min_gain}% ending within "
-            f"last {recency_days} sessions"
-        )
-        # print(f"[FILTER] {msg}")
-        if job_id:
-            job_log(job_id, msg, "fail")
-        return None
-
-    surge_start_idx, surge_end_idx = best_window
-    surge_end_date  = scan_dates[surge_end_idx]
-    days_since_end  = (datetime.now(IST).date() - surge_end_date.date()).days
-
-    # ── CRITICAL: Use SURGE_HIGH as resistance (not yesterday_high) ────────
-    # The surge window's highest point is the true resistance level where
-    # price exhausted momentum. Even after breakdown + recovery, this level
-    # will likely reject price again (as seen in DIXON 20 May 2025 example).
-    #
-    # FIX: scan the FULL range from surge_start to breakdown_idx (exclusive)
-    # rather than just to surge_end_idx.  The wick filter is used only for
-    # gain calculation to pick the best window — it must NOT cap the resistance
-    # level itself.  If the highest intraday High (e.g. 424.70) sits on a
-    # candle with a long upper wick, the wick filter may cause the gain loop to
-    # select an earlier/shorter window (whose end is 356), making
-    # surge_high = 356.  The real resistance is still 424.70 — the highest
-    # High between surge start and the breakdown candle, regardless of wicks.
-    surge_window_highs = scan_highs[surge_start_idx:breakdown_idx]   # full range: surge_start → pre-breakdown
-    surge_high         = float(np.max(surge_window_highs))
-
-    # Identify whether the peak candle used High or Close (wick filter result)
-    best_peak_idx   = surge_start_idx + int(np.argmax(surge_window_highs))
-    best_peak_high  = float(scan_highs[best_peak_idx])
-    best_peak_close = float(scan_closes[best_peak_idx])
-    _wick_threshold = best_peak_high * (1.0 - wick_filter_pct / 100.0)
-    gain_used_high  = best_peak_close >= _wick_threshold   # True = High used; False = Close used
-
-    if job_id:
-        peak_label = f"High Rs{best_peak_high:.2f}" if gain_used_high else \
-                     f"Close Rs{best_peak_close:.2f} (wick filtered, High Rs{best_peak_high:.2f})"
-        job_log(job_id,
-            f"{ticker} PASS  surge={best_gain:.1f}% (peak={peak_label})  greens={best_greens}  "
-            f"allowed_reds={best_reds}  ended {days_since_end}d ago  "
-            f"drop={drop_pct:.2f}%  vol={volume_ratio:.2f}x  "
-            f"EMA{ema_period}={ema_at_detection:.2f} (breached at detection)  "
-            f"surge_high=Rs{surge_high:.2f} (resistance)  "
-            f"yesterday_high=Rs{yesterday_high:.2f}",
-            "pass")
-
-    return {
-        "ticker":                  ticker,
-        "today_close":             round(today_close, 2),
-        "surge_high":              round(surge_high, 2),        # TRUE RESISTANCE (surge peak)
-        "yesterday_high":          round(yesterday_high, 2),    # Day before breakdown
-        "yesterday_close":         round(yesterday_close, 2),
-        "yesterday_low":           round(yesterday_low, 2),
-        "drop_pct":                round(drop_pct, 2),
-        "breakdown_volume":        int(breakdown_vol),
-        "avg_volume_20d":          int(avg_vol_20d),
-        "volume_ratio":            round(volume_ratio, 2),
-        "ema_at_detection":        round(ema_at_detection, 2),  # EMA value at breakdown candle
-        "ema_breached_at_detection": True,                      # Legacy compat
-        "below_ema":               below_ema,                   # kept for UI/legacy compat
-        "surge_gain_pct":          round(best_gain, 2),
-        "surge_gain_used_high":    gain_used_high,              # True = High-based; False = wick-filtered close
-        "surge_candles":           best_greens,
-        "surge_allowed_reds":      best_reds,
-        "surge_start_date":        scan_dates[surge_start_idx].strftime("%Y-%m-%d"),
-        "surge_end_date":          surge_end_date.strftime("%Y-%m-%d"),
-        "days_since_surge_end":    days_since_end,
-        "breakdown_date":          dates[breakdown_idx].strftime("%Y-%m-%d"),
-        # Previous-Pullup-High filter metadata (Check 1)
-        "prev_pullup_high":        round(lifetime_high, 2) if lifetime_high else None,
-        # 52-week high metadata (Check 1b)
-        "lifetime_52w_high":       round(lifetime_52w_high, 2) if lifetime_52w_high else None,
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-#  SCREENING -- STEP 2
-# ─────────────────────────────────────────────────────────────
-def find_best_strike(candidate: Dict, cfg: Dict, job_id: str = "") -> Optional[Dict]:
-    ticker      = candidate["ticker"]
-    surge_high  = candidate["surge_high"]   # TRUE resistance (surge peak)
-
-    if job_id:
-        job_log(job_id, f"{ticker} -> fetching option chain...", "info")
-
-    strike_map, expiry = fetch_option_chain(ticker)
-    if strike_map is None or not strike_map:
-        if job_id:
-            job_log(job_id, f"{ticker} option chain empty", "fail")
-        return None
-
-    # Strike anchored ABOVE surge_high (true resistance), not yesterday_high.
-    # CE goes ITM only if price breaks above the surge peak -- exactly
-    # the scenario our thesis says is unlikely (as seen in DIXON 20 May example).
-    strike = nearest_round_strike_above(surge_high, strike_map)
-    if strike is None:
-        if job_id:
-            job_log(job_id,
-                f"{ticker} no liquid strike above surge_high Rs{surge_high:.2f}",
-                "fail")
-        return None
-
-    ce_data = strike_map[strike]
-    ce_ltp  = ce_data["CE_ltp"]
-    ce_oi   = ce_data["CE_oi"]
-
-    if job_id:
-        job_log(job_id,
-            f"{ticker} -> strike Rs{strike:.0f} CE (surge_high Rs{surge_high:.2f}) "
-            f"| LTP Rs{ce_ltp:.2f} | OI {ce_oi:,}",
-            "info")
-
-    if ce_ltp <= 0:
-        if job_id:
-            job_log(job_id, f"{ticker} strike Rs{strike:.0f} CE LTP=0 (illiquid)", "fail")
-        return None
-
-    # ── IMPLIED VOLATILITY ────────────────────────────────────────────────────
-    spot_price = float(candidate.get("today_close", 0) or strike * 0.97)
-    iv_pct = compute_iv(spot_price, strike, ce_ltp, expiry)
-    if job_id:
-        iv_str = f"{iv_pct:.1f}%" if iv_pct is not None else "N/A"
-        job_log(job_id, f"{ticker} IV={iv_str}  strike Rs{strike:.0f}  spot Rs{spot_price:.2f}", "info")
-
-    ce_hist_high        = None
-    ce_above_30d_status = "Unverified"
-    nse_hist_calls      = 0
-    remark              = "Unverified 30d High"
-
-    if cfg.get("ce_above_historical_high", True):
-        ce_hist_high, nse_hist_calls = get_ce_historical_high(
-            ticker, strike, expiry, cfg.get("ce_history_days", 30)
-        )
-        if ce_hist_high is not None:
-            if ce_ltp <= ce_hist_high:
-                ce_above_30d_status = False
-                remark = "CE Below 30d High"
-                if job_id:
-                    job_log(job_id,
-                        f"{ticker} CE LTP Rs{ce_ltp} <= 30d high Rs{ce_hist_high} -- included with caution",
-                        "warn")
-            else:
-                ce_above_30d_status = True
-                remark = "CE at New High"
-                if job_id:
-                    job_log(job_id,
-                        f"{ticker} CE LTP Rs{ce_ltp} > 30d high Rs{ce_hist_high} -- strong signal",
-                        "signal")
-    else:
-        remark = "check disabled"
-
-    if job_id:
-        job_log(job_id,
-            f"{ticker} SIGNAL  Rs{strike:.0f} CE  LTP Rs{ce_ltp:.2f}  [{remark}]",
-            "signal")
-
-    # ── CHECK 2: Bear Call Spread ─────────────────────────────────────────────
-    # Strategy: SELL short CE (at `strike`, above surge high)  +  BUY hedge CE
-    # (N intervals higher) to cap max loss.
-    #
-    #   Net Premium (credit)  = short_CE_ltp  - hedge_CE_ltp
-    #   Max Profit            = Net Premium   (price stays below short strike)
-    #   Max Loss              = spread_width  - Net Premium
-    #   Breakeven             = short_strike  + Net Premium
-    #   Risk/Reward           = Max Loss / Net Premium
-    #
-    # The hedge leg is sourced directly from the same option-chain snapshot
-    # already in memory — no extra NSE call needed.
-    # ─────────────────────────────────────────────────────────────────────────
-    spread_intervals    = int(cfg.get("bear_call_spread_width_intervals", 1))
-    hedge_strike        = None
-    hedge_ce_ltp        = 0.0
-    hedge_ce_oi         = 0
-    spread_net_premium  = None
-    spread_max_profit   = None
-    spread_max_loss     = None
-    spread_breakeven    = None
-    spread_risk_reward  = None
-    spread_width        = None
-
-    if spread_intervals > 0:
-        interval   = nse_strike_interval(strike)
-        # Try spread_intervals, then spread_intervals+1, then +2 to find a
-        # liquid hedge leg in the strike_map.
-        for extra in range(spread_intervals, spread_intervals + 3):
-            candidate_hedge = strike + extra * interval
-            if candidate_hedge in strike_map and strike_map[candidate_hedge]["CE_ltp"] > 0:
-                hedge_strike  = candidate_hedge
-                hedge_ce_ltp  = float(strike_map[candidate_hedge]["CE_ltp"])
-                hedge_ce_oi   = int(strike_map[candidate_hedge]["CE_oi"])
-                break
-
-        if hedge_strike is not None and hedge_ce_ltp > 0 and ce_ltp > hedge_ce_ltp:
-            spread_width       = round(hedge_strike - strike, 2)
-            spread_net_premium = round(ce_ltp - hedge_ce_ltp, 2)
-            spread_max_profit  = spread_net_premium                              # per unit
-            spread_max_loss    = round(spread_width - spread_net_premium, 2)    # per unit
-            spread_breakeven   = round(strike + spread_net_premium, 2)
-            spread_risk_reward = (
-                round(spread_max_loss / spread_net_premium, 2)
-                if spread_net_premium > 0 else None
-            )
-            if job_id:
-                job_log(
-                    job_id,
-                    f"{ticker} Bear-Call-Spread: "
-                    f"SELL Rs{strike:.0f} CE @ Rs{ce_ltp:.2f}  "
-                    f"BUY Rs{hedge_strike:.0f} CE @ Rs{hedge_ce_ltp:.2f}  "
-                    f"| Net Credit Rs{spread_net_premium:.2f}  "
-                    f"Max-Profit Rs{spread_max_profit:.2f}  "
-                    f"Max-Loss Rs{spread_max_loss:.2f}  "
-                    f"Breakeven Rs{spread_breakeven:.2f}  "
-                    f"R:R 1:{spread_risk_reward}",
-                    "signal",
-                )
-        else:
-            if job_id:
-                reason = (
-                    "no liquid hedge strike found above short CE"
-                    if hedge_strike is None
-                    else f"hedge CE LTP Rs{hedge_ce_ltp:.2f} >= short CE LTP Rs{ce_ltp:.2f} (debit spread — skip)"
-                )
-                job_log(job_id, f"{ticker} Bear-Call-Spread: {reason}", "warn")
-
-    return {
-        "Ticker":               ticker,
-        # Price action
-        "Today_Close":          candidate["today_close"],
-        "Surge_High":           candidate["surge_high"],        # TRUE RESISTANCE (surge peak)
-        "Yesterday_High":       candidate["yesterday_high"],    # Day before breakdown
-        "Yesterday_Close":      candidate["yesterday_close"],
-        "Yesterday_Low":        candidate["yesterday_low"],
-        "Drop_Pct":             candidate["drop_pct"],
-        # Volume
-        "Breakdown_Volume":     candidate["breakdown_volume"],
-        "Avg_Volume_20d":       candidate["avg_volume_20d"],
-        "Volume_Ratio":         candidate["volume_ratio"],
-        # Trend — EMA was breached at initial detection; not re-checked on retest days
-        "EMA_At_Detection":         candidate["ema_at_detection"],
-        "EMA_Breached_At_Detection": candidate["ema_breached_at_detection"],
-        "Below_EMA":                candidate["below_ema"],          # legacy compat
-        # Surge
-        "Surge_Gain_Pct":       candidate["surge_gain_pct"],
-        "Surge_Gain_Used_High": candidate.get("surge_gain_used_high", False),  # True = High-based gain
-        "Surge_Candles":        candidate["surge_candles"],
-        "Surge_Allowed_Reds":   candidate["surge_allowed_reds"],
-        "Surge_Start":          candidate["surge_start_date"],
-        "Surge_End":            candidate["surge_end_date"],
-        "Days_Since_Surge_End": candidate["days_since_surge_end"],
-        # Previous-Pullup-High filter metadata (Check 1)
-        "Prev_Pullup_High":     candidate.get("prev_pullup_high"),
-        # Lifetime 52-week high metadata (Check 1b)
-        "Lifetime_52W_High":    candidate.get("lifetime_52w_high"),
-        # Short CE leg  (Check 2 — primary sell leg)
-        "Suggested_Strike":     strike,
-        "Expiry":               expiry,
-        "CE_LTP":               round(ce_ltp, 2),
-        "CE_OI":                ce_oi,
-        "IV_Pct":               iv_pct,          # Implied Volatility %
-        "CE_30d_High":          round(ce_hist_high, 2) if ce_hist_high else "N/A",
-        "CE_Above_30d_High":    ce_above_30d_status,
-        "Remark":               remark,
-        "NSE_Hist_Calls":       nse_hist_calls,
-        # Bear Call Spread — hedge (buy) leg  (Check 2)
-        # All None when spread disabled or no liquid hedge found.
-        "BCS_Hedge_Strike":     hedge_strike,
-        "BCS_Hedge_CE_LTP":     round(hedge_ce_ltp, 2) if hedge_ce_ltp else None,
-        "BCS_Hedge_CE_OI":      hedge_ce_oi if hedge_ce_oi else None,
-        "BCS_Spread_Width":     spread_width,
-        "BCS_Net_Premium":      spread_net_premium,
-        "BCS_Max_Profit":       spread_max_profit,
-        "BCS_Max_Loss":         spread_max_loss,
-        "BCS_Breakeven":        spread_breakeven,
-        "BCS_Risk_Reward":      spread_risk_reward,
-        # Meta
-        "Status":               "Momentum Lost",
-        "Sell_Alert_Sent":      False,
-        # Gate 2 — EMA+volume breach after breakdown (sticky)
-        "Breakdown_Date":            candidate.get("breakdown_date"),
-        "Sell_Zone_EMA_Confirmed":   False,
-        "Sell_Zone_EMA_Confirm_Date": None,
-        "Scanned_At":           now_ist_str(),
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-#  GATE 2 — EMA + VOLUME CONFIRMATION AFTER BREAKDOWN
-#
-#  After the momentum break (Gate 1 / signal creation), price must
-#  close below the 9-EMA at least ONCE with above-average volume
-#  before the sell zone (Gate 3) can fire.
-#
-#  This is tracked per-signal as Sell_Zone_EMA_Confirmed (sticky).
-# ─────────────────────────────────────────────────────────────
-def check_ema_confirmed_after_breakdown(
-    ticker: str, breakdown_date_str: str, cfg: Dict
-) -> Tuple[bool, Optional[str], Optional[float]]:
-    """
-    Scan from breakdown_date forward.  Return
-        (True, confirm_date, recomputed_surge_high)
-    on the first candle where close < 9-EMA AND volume >= min_breakdown_volume_ratio × 20d avg.
-
-    recomputed_surge_high mirrors the backtest.py Gate-2 refinement:
-        After Gate 2 fires, the true resistance is the highest HIGH in the
-        surge_recency_days window BEFORE the breakdown candle, up to (but not
-        including) the Gate-2 candle.  The original Gate-1 surge detection
-        sometimes finds a small late sub-window and misses the real price peak;
-        this broader max() always captures it correctly.
-    """
-    ema_period    = int(cfg.get("ema_period", 9))
-    min_vol_ratio = float(cfg.get("min_breakdown_volume_ratio", 0.5))
-    recency_days  = int(cfg.get("surge_recency_days", 5))
-
-    hist = get_price_history(ticker, cfg.get("lookback_days", 45))
-    if hist is None or hist.empty:
-        return False, None, None
-
-    hist = hist.sort_index()
-    closes = hist["Close"].values
-    highs  = hist["High"].values          # needed for surge_high recomputation
-    vols   = hist["Volume"].values
-    dates  = hist.index
-
-    ema_values = compute_ema(closes, ema_period)
-
-    try:
-        bd_date = datetime.strptime(breakdown_date_str, "%Y-%m-%d").date()
-    except Exception:
-        return False, None, None
-
-    # 20d average volume over the full window (pre-breakdown baseline)
-    avg_vol_20d = float(np.mean(vols[-20:])) if len(vols) >= 20 else float(np.mean(vols))
-    if avg_vol_20d <= 0:
-        return False, None, None
-
-    # Find start index — first candle at or after the breakdown date
-    start_idx = next(
-        (i for i, d in enumerate(dates) if d.date() >= bd_date),
-        None
-    )
-    if start_idx is None:
-        return False, None, None
-
-    for i in range(start_idx, len(closes)):
-        if closes[i] < ema_values[i]:
-            vol_ratio = float(vols[i]) / avg_vol_20d
-            if vol_ratio >= min_vol_ratio:
-                # ── Recompute surge_high: max high from (breakdown - recency_days)
-                #    up to (but not including) this Gate-2 candle.
-                #    Mirrors backtest.py backtest_ticker() lines 592-596.
-                lookback_start = max(0, start_idx - recency_days)
-                if lookback_start < i:
-                    recomputed_surge_high = float(np.max(highs[lookback_start:i]))
-                else:
-                    recomputed_surge_high = None
-                return True, dates[i].strftime("%Y-%m-%d"), recomputed_surge_high
-
-    return False, None, None
-
-
-def update_sell_zone_gates(cfg: Dict) -> int:
-    """
-    Called every scan cycle.  For each signal where Gate 2 is not yet
-    confirmed, check if price has now closed below 9-EMA with volume.
-    Gate 2 confirmation is STICKY — once set it is never cleared.
-
-    When Gate 2 fires, surge_high is RECOMPUTED to the max high over
-    surge_recency_days before breakdown up to the Gate-2 candle (mirrors
-    backtest.py).  If the recomputed value is higher than the stored one,
-    Suggested_Strike is also updated using NSE standard intervals (no
-    extra option-chain call needed).
-
-    Returns the count of newly confirmed signals.
-    """
-    signals = load_signals()
-    newly_confirmed = 0
-    changed = False
-
-    for sig in signals:
-        if sig.get("Sell_Zone_EMA_Confirmed"):
-            continue  # already confirmed — skip
-
-        breakdown_date = sig.get("Breakdown_Date")
-        if not breakdown_date:
-            continue
-
-        ticker = sig["Ticker"]
-        confirmed, confirm_date, new_surge_high = check_ema_confirmed_after_breakdown(
-            ticker, breakdown_date, cfg
-        )
-        time.sleep(random.uniform(1.0, 2.0))  # throttle yfinance calls — increased per user request to avoid rate-limits
-
-        if confirmed:
-            sig["Sell_Zone_EMA_Confirmed"]    = True
-            sig["Sell_Zone_EMA_Confirm_Date"] = confirm_date
-            newly_confirmed += 1
-            changed = True
-            print(f"[Gate2] {ticker} Gate 2 confirmed on {confirm_date}")
-
-            # ── Surge-high refinement (backtest.py parity) ────────────────
-            # The Gate-1 surge detection may have found a narrow late window,
-            # missing the actual price peak.  The broader max() from
-            # check_ema_confirmed_after_breakdown() corrects this.
-            if new_surge_high is not None and new_surge_high > 0:
-                old_surge_high = float(sig.get("Surge_High") or 0)
-                if new_surge_high != old_surge_high:
-                    sig["Surge_High"] = round(new_surge_high, 2)
-                    print(f"[Gate2] {ticker} surge_high refined: "
-                          f"Rs{old_surge_high:.2f} → Rs{new_surge_high:.2f}")
-
-                    # Recompute strike if the resistance ceiling moved up.
-                    # Use math-only helper to avoid an extra NSE call.
-                    if new_surge_high > old_surge_high:
-                        new_strike = nearest_otm_strike_math(new_surge_high)
-                        old_strike = sig.get("Suggested_Strike", 0)
-                        if new_strike != old_strike:
-                            sig["Suggested_Strike"] = new_strike
-                            print(f"[Gate2] {ticker} strike updated: "
-                                  f"{old_strike} → {new_strike:.0f}")
-
-    if changed:
-        save_signals(signals)
-
-    return newly_confirmed
-
-
-
-#  Reference: Yesterday_High = resistance ceiling defined at scan time.
-#
-#  Alert fires when:
-#      floor = yesterday_high * (1 - proximity_pct / 100)
-#      floor <= cur_price <= yesterday_high
-#
-#  Price above yesterday_high = breakout, thesis invalidated, skip.
-#  Duplicate alerts for the same ticker within 30 min are suppressed.
-# ─────────────────────────────────────────────────────────────
-def check_proximity_alerts(signals: List[Dict], cfg: Dict) -> List[Dict]:
-    proximity_pct  = cfg["price_proximity_percent"]
-    sell_zone_hits = []
-
-    for sig in signals:
-        ticker = sig["Ticker"]
-
-        # ── GATE 2 GUARD: EMA+volume breach after breakdown must be confirmed ─
-        if not sig.get("Sell_Zone_EMA_Confirmed"):
-            print(f"[PROXIMITY] {ticker} SKIP — Gate 2 (EMA+vol) not yet confirmed")
-            time.sleep(random.uniform(0.1, 0.3))
-            continue
-
-        # Surge_High (surge peak) is the primary resistance ceiling.
-        resistance = (
-            sig.get("Surge_High")
-            or sig.get("Yesterday_High")
-            or sig.get("Ten_Day_High")
-            or sig.get("Suggested_Strike")
-        )
-        if not resistance:
-            time.sleep(random.uniform(0.2, 0.5))
-            continue
-
-        cur_price = get_current_price(ticker)
-        if cur_price is None:
-            time.sleep(random.uniform(0.2, 0.5))
-            continue
-
-        surge_high_val    = float(sig.get("Surge_High") or 0)
-        proximity_ceiling = surge_high_val or float(resistance)
-
-        # above_surge: price is AT or ABOVE the surge-high resistance.
-        # This means an active retest is happening — CE selling is most urgent.
-        # We keep it in the sell zone rather than skipping it.
-        above_surge  = surge_high_val > 0 and cur_price >= surge_high_val
-
-        # dist_pct: signed distance from resistance.
-        # Negative value means price is above resistance (above_surge case).
-        dist_pct = (proximity_ceiling - cur_price) / proximity_ceiling * 100
-
-        # in_sell_zone: either an active retest above resistance, or
-        # price within the configured proximity band below resistance.
-        in_sell_zone = above_surge or (dist_pct <= proximity_pct)
-
-        if not in_sell_zone:
-            print(f"[PROXIMITY] {ticker} SKIP — distance {dist_pct:.2f}% > {proximity_pct}% limit  "
-                  f"(price Rs{cur_price:.2f} vs resistance Rs{proximity_ceiling:.2f})")
-            time.sleep(random.uniform(0.2, 0.5))
-            continue
-
-        if above_surge:
-            print(f"[PROXIMITY] {ticker} BREAKOUT — price Rs{cur_price:.2f} >= surge_high "
-                  f"Rs{proximity_ceiling:.2f}  dist={dist_pct:.2f}%  ✅ in sell zone")
-
-        if in_sell_zone:
-            # ── OPTIONS PROCESSING KILL-SWITCH ───────────────────────────────
-            # When the user has disabled options processing via the header
-            # toggle, we skip the ENTIRE sell-zone alert path — no option
-            # ladder fetch, no hit dict, no save, and MOST IMPORTANTLY no
-            # Telegram send. Without this guard, send_telegram() below would
-            # still fire every time a Gate-2-confirmed signal entered the sell
-            # zone, even though fetch_option_chain() was short-circuited.
-            # The user explicitly reported this bug: "even though I added the
-            # Options Toggle UI, telegram alerts keep throwing."
-            if not is_options_processing_enabled():
-                print(f"[PROXIMITY] {ticker} SKIP — options processing disabled by user "
-                      f"(no alert, no Telegram, no NSE call)")
-                time.sleep(random.uniform(0.1, 0.3))
-                continue
-
-            g2_date = sig.get("Sell_Zone_EMA_Confirm_Date", "?")
-
-            # ── Option ladder with CE gain% to spot the hottest strike ──────
-            # OTM-only ladder: ALL strikes strictly above cur_price.
-            # Priority for "hottest": CE_high_chg_pct (high-based surge from prev close)
-            #   — this catches strikes that spiked hard intraday even if LTP pulled back.
-            # Fallback: CE_chg_pct (LTP-based), then highest CE_ltp (market-closed / no prev).
-            opt_ladder: List[Dict] = []
-            hot_strike       = None
-            hot_chg_pct      = None   # LTP-based gain% of hottest strike
-            hot_ltp          = None
-            hot_high         = None   # intraday high of hottest strike's CE premium
-            hot_high_chg_pct = None   # high-based gain% of hottest strike
-            try:
-                # Retry up to 3 times with backoff — NSE rate-limits on rapid sequential calls
-                sm, exp_live = None, None
-                for _attempt in range(3):
-                    sm, exp_live = fetch_option_chain(ticker)
-                    if sm:
-                        break
-                    if _attempt < 2:
-                        wait = random.uniform(3.0, 5.0) * (_attempt + 1)
-                        print(f"[{ticker}] Opt-chain attempt {_attempt+1} failed — retrying in {wait:.1f}s")
-                        time.sleep(wait)
-                print(f"[{ticker}] Proximity opt-ladder: sm={'None' if not sm else f'{len(sm)} strikes'}  market_open={is_market_open()}")
-                if sm:
-                    sorted_sk = sorted(sm.keys())
-
-                    # OTM-only: every strike strictly above current price
-                    otm_strikes = [s for s in sorted_sk if s > cur_price]
-
-                    for sk in otm_strikes:
-                        sdata = sm[sk]
-                        ce_ltp = sdata["CE_ltp"]
-                        # Include all OTM strikes that have any LTP (even illiquid ones shown as 0)
-                        moneyness_label = f"+{otm_strikes.index(sk)+1} OTM"
-                        opt_ladder.append({
-                            "strike":          sk,
-                            "moneyness":       moneyness_label,
-                            "ltp":             round(ce_ltp, 2),
-                            "high":            sdata.get("CE_high"),
-                            "chg":             sdata.get("CE_chg"),
-                            "chg_pct":         sdata.get("CE_chg_pct"),
-                            "high_chg_pct":    sdata.get("CE_high_chg_pct"),
-                            "prev":            sdata.get("CE_prev"),
-                            "oi":              sdata["CE_oi"],
-                        })
-
-                    # ── Hottest strike: scan ALL OTM strikes ──────────────────
-                    # Primary: highest high_chg_pct (intraday peak surge from prev close)
-                    # Secondary: highest chg_pct (LTP-based)
-                    # Fallback: highest LTP (market closed / no prev data)
-                    with_high_pct = [r for r in opt_ladder if r["high_chg_pct"] is not None and r["ltp"] > 0]
-                    with_pct      = [r for r in opt_ladder if r["chg_pct"]      is not None and r["ltp"] > 0]
-                    with_ltp      = [r for r in opt_ladder if r["ltp"] > 0]
-
-                    print(f"[{ticker}] OTM ladder={len(opt_ladder)} "
-                          f"with_high_pct={len(with_high_pct)} "
-                          f"with_pct={len(with_pct)} with_ltp={len(with_ltp)}")
-
-                    if with_high_pct:
-                        hottest          = max(with_high_pct, key=lambda r: r["high_chg_pct"])
-                        hot_strike       = hottest["strike"]
-                        hot_chg_pct      = hottest["chg_pct"]
-                        hot_ltp          = hottest["ltp"]
-                        hot_high         = hottest["high"]
-                        hot_high_chg_pct = hottest["high_chg_pct"]
-                    elif with_pct:
-                        hottest          = max(with_pct, key=lambda r: r["chg_pct"])
-                        hot_strike       = hottest["strike"]
-                        hot_chg_pct      = hottest["chg_pct"]
-                        hot_ltp          = hottest["ltp"]
-                        hot_high         = hottest["high"]
-                        hot_high_chg_pct = hottest.get("high_chg_pct")
-                    elif with_ltp:
-                        # Market closed or no prev data — rank by highest LTP (most active strike)
-                        hottest          = max(with_ltp, key=lambda r: r["ltp"])
-                        hot_strike       = hottest["strike"]
-                        hot_chg_pct      = None   # no change data available
-                        hot_ltp          = hottest["ltp"]
-                        hot_high         = hottest["high"]
-                        hot_high_chg_pct = hottest.get("high_chg_pct")
-
-                    print(f"[{ticker}] hot_strike={hot_strike}  "
-                          f"hot_high_chg_pct={hot_high_chg_pct}  "
-                          f"hot_chg_pct={hot_chg_pct}  hot_ltp={hot_ltp}  hot_high={hot_high}")
-                else:
-                    print(f"[{ticker}] fetch_option_chain returned empty — NSE session issue or market closed")
-            except Exception as _e_opt:
-                print(f"[{ticker}] Proximity opt-ladder error: {_e_opt}")
-
-            hit = {
-                **sig,
-                "Current_Price":          round(cur_price, 2),
-                "Resistance_High":        round(proximity_ceiling, 2),
-                "Distance_From_High_Pct": round(dist_pct, 2),   # negative = above resistance
-                "Above_Surge":            above_surge,
-                "Alert_Time":             now_ist_str(),
-                # Option premium surge data — OTM-only full ladder
-                "Opt_Ladder":             opt_ladder,
-                "Hot_Strike":             hot_strike,
-                "Hot_CE_Chg_Pct":         hot_chg_pct,      # LTP-based gain%
-                "Hot_CE_LTP":             hot_ltp,
-                "Hot_CE_High":            hot_high,          # intraday high of CE premium
-                "Hot_CE_High_Chg_Pct":    hot_high_chg_pct, # high-based gain% (peak surge)
-            }
-            sell_zone_hits.append(hit)
-
-            # ── Telegram alert ─────────────────────────────────────────────────
-            # Build 130%+ surge warning line if any OTM strike's intraday CE high
-            # surged >= 130% from previous close
-            surge_alert_lines = []
-            for rung in opt_ladder:
-                hcp = rung.get("high_chg_pct")
-                if hcp is not None and hcp >= 130.0:
-                    surge_alert_lines.append(
-                        f"  🔥 Rs{rung['strike']:.0f} CE: High Rs{rung['high']} "
-                        f"(+{hcp:.1f}% from prev Rs{rung['prev']})"
-                    )
-            surge_block = ""
-            if surge_alert_lines:
-                surge_block = (
-                    f"\n⚡ *130%+ PREMIUM SURGE DETECTED*\n"
-                    + "\n".join(surge_alert_lines)
-                    + "\n"
-                )
-
-            hot_line = ""
-            if hot_strike:
-                if hot_high_chg_pct is not None:
-                    hot_line = (
-                        f"🌡 Hottest OTM: Rs{hot_strike:.0f} CE  "
-                        f"High Rs{hot_high} (+{hot_high_chg_pct:.1f}% peak)  "
-                        f"LTP Rs{hot_ltp}"
-                    )
-                elif hot_chg_pct is not None:
-                    hot_line = (
-                        f"🌡 Hottest OTM: Rs{hot_strike:.0f} CE  "
-                        f"LTP Rs{hot_ltp} (+{hot_chg_pct:.1f}%)"
-                    )
-                else:
-                    hot_line = f"🌡 Hottest OTM: Rs{hot_strike:.0f} CE  LTP Rs{hot_ltp}"
-
-            # ── DEFENSE-IN-DEPTH: never fire Telegram when options are disabled ──
-            # The top-of-block guard above (line ~1636) should already have
-            # skipped us via `continue`, so we should never reach here with
-            # options disabled. But this second guard guarantees that NO
-            # Telegram message can ever leave the server when the user has
-            # turned options OFF — regardless of future code refactors that
-            # might add new early-return paths or restructure the sell-zone
-            # block. Belt and suspenders.
-            if not is_options_processing_enabled():
-                print(f"[PROXIMITY] {ticker} in sell zone but options disabled — "
-                      f"Telegram SUPPRESSED (defense-in-depth guard)")
-            else:
-                send_telegram(
-                    cfg["telegram_bot_token"],
-                    cfg["telegram_chat_id"],
-                    f"*SELL ZONE — {ticker}* ✅ All 3 Gates Passed\n"
-                    f"Gate 1 ✅ Momentum break (close < prev low)\n"
-                    f"Gate 2 ✅ EMA breach confirmed {g2_date}\n"
-                    f"Gate 3 ✅ "
-                    + (
-                        f"Price Rs{cur_price:.2f} BROKE ABOVE Surge High Rs{proximity_ceiling:.2f} "
-                        f"(+{abs(dist_pct):.2f}% above resistance) 🚨 RETEST IN PROGRESS\n"
-                        if above_surge else
-                        f"Price Rs{cur_price:.2f} within {dist_pct:.2f}% of Surge High "
-                        f"Rs{proximity_ceiling:.2f} (limit {proximity_pct}%)\n"
-                    ) +
-                    f"Strike Rs{sig.get('Suggested_Strike','?')} CE  "
-                    f"Expiry {sig.get('Expiry','?')}\n"
-                    f"Surge Gain: {sig.get('Surge_Gain_Pct','?')}% "
-                    f"({'High-based ✅' if sig.get('Surge_Gain_Used_High') else 'Close-based (wick filtered)'})\n"
-                    f"BCS: SELL Rs{sig.get('Suggested_Strike','?')} / "
-                    f"BUY Rs{sig.get('BCS_Hedge_Strike','?')}  "
-                    f"Net Premium Rs{sig.get('BCS_Net_Premium','?')}\n"
-                    f"{surge_block}"
-                    f"{hot_line}"
-                )
-
-        time.sleep(random.uniform(0.2, 0.5))
-
-    return sell_zone_hits
-
-
-
-
-# ─────────────────────────────────────────────────────────────
-#  SIGNAL PRUNING
-# ─────────────────────────────────────────────────────────────
-def prune_stale_signals(signals: List[Dict], cfg: Dict) -> Tuple[List[Dict], int]:
-    max_age = int(cfg.get("max_signal_age_days", 10))
-    cutoff  = datetime.now(IST) - timedelta(days=max_age)
-    fresh, pruned = [], 0
-    for s in signals:
-        try:
-            scanned = datetime.strptime(s["Scanned_At"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-            if scanned >= cutoff:
-                fresh.append(s)
-            else:
-                pruned += 1
-        except Exception:
-            fresh.append(s)
-    return fresh, pruned
-
-
-# ─────────────────────────────────────────────────────────────
-#  SCREEN JOB
-# ─────────────────────────────────────────────────────────────
-def run_screen_job(tickers: List[str], cfg: Dict, job_id: str):
-    signals   = []
-    total     = len(tickers)
-    nse_calls = 0
-
-    job_log(job_id, f"Starting scan of {total} tickers...", "info")
-
-    for idx, ticker in enumerate(tickers):
-        job_progress(job_id, idx, total, ticker)
-        candidate = check_surge_and_loss(ticker, cfg, job_id)
-        if candidate is None:
-            time.sleep(random.uniform(0.1, 0.3))
-            continue
-
-        time.sleep(random.uniform(3.0, 5.0))
-        signal = find_best_strike(candidate, cfg, job_id)
-        nse_calls += 2
-        if signal is None:
-            continue
-
-        signals.append(signal)
-        time.sleep(random.uniform(2.0, 4.0))
-
-    # ── Update Gate 2 state for all signals (including newly found ones) ──
-    gate2_new = update_sell_zone_gates(cfg)
-    if gate2_new:
-        job_log(job_id, f"Gate 2 newly confirmed for {gate2_new} signal(s)", "info")
-
-    # Prune stale then merge
-    existing, pruned = prune_stale_signals(load_signals(), cfg)
-    if pruned:
-        job_log(job_id, f"Pruned {pruned} stale signal(s) (>{cfg.get('max_signal_age_days',10)}d)", "info")
-
-    seen  = {s["Ticker"] for s in existing}
-    added = 0
-    for s in signals:
-        if s["Ticker"] not in seen:
-            existing.append(s)
-            seen.add(s["Ticker"])
-            added += 1
-        else:
-            # Refresh signal but PRESERVE Gate 2 sticky state
-            old = next((ex for ex in existing if ex["Ticker"] == s["Ticker"]), None)
-            if old:
-                s["Sell_Zone_EMA_Confirmed"]    = old.get("Sell_Zone_EMA_Confirmed", False)
-                s["Sell_Zone_EMA_Confirm_Date"] = old.get("Sell_Zone_EMA_Confirm_Date")
-            existing = [s if ex["Ticker"] == s["Ticker"] else ex for ex in existing]
-
-    save_signals(existing)
-
-    log = load_scan_log()
-    log.append({
-        "time":            now_ist_str(),
-        "tickers_scanned": total,
-        "signals_found":   len(signals),
-        "nse_calls":       nse_calls,
-    })
-    save_scan_log(log[-100:])
-
-    job_log(job_id,
-        f"Done -- {len(signals)} signal(s) found, {added} new, {pruned} pruned.", "info")
-    job_progress(job_id, total, total, "")
-    job_done(job_id, signals)
-
-
-# ─────────────────────────────────────────────────────────────
-#  PREMIUM SELL ZONE SCAN
-#
-#  For every Gate-2-confirmed signal that is currently in the
-#  proximity range (Gate 3), this scan:
-#    1. Measures live volume vs 20d average (volume surge ratio).
-#    2. Fetches option chain and builds an ATM + OTM ladder
-#       showing CE premiums across multiple strikes.
-#    3. Computes a "Premium Score" = vol_surge × ATM_CE_LTP.
-#       Higher score ↔ more premium available right now.
-#
-#  Thesis: high volume at resistance + elevated CE premiums =
-#  ideal time to SELL CE for maximum theta decay profit.
-# ─────────────────────────────────────────────────────────────
-def scan_premium_zone_job(cfg: Dict, job_id: str) -> List[Dict]:
-    """
-    Scans Gate-2-confirmed signals that are in proximity range.
-    Returns list of dicts sorted by Premium_Score descending.
-    """
-    signals       = load_signals()
-    prox_pct      = float(cfg.get("price_proximity_percent", 2.0))
-    min_vol_surge = float(cfg.get("premium_min_vol_surge", 1.5))
-    otm_depth     = int(cfg.get("premium_otm_depth", 3))
-
-    # Only Gate-2 confirmed signals are considered — breakdown + EMA breach validated
-    gate2 = [s for s in signals if s.get("Sell_Zone_EMA_Confirmed")]
-    job_log(job_id,
-        f"Premium Zone: {len(gate2)} Gate-2-confirmed signal(s) to evaluate",
-        "info")
-
-    results: List[Dict] = []
-    skipped_low_vol: int   = 0   # Gate-2+proximity stocks skipped due to vol < threshold
-
-    for sig in gate2:
-        ticker     = sig["Ticker"]
-        resistance = (
-            sig.get("Surge_High")
-            or sig.get("Yesterday_High")
-            or sig.get("Suggested_Strike")
-        )
-        if not resistance:
-            continue
-
-        # ── Live price ──────────────────────────────────────────────────────
-        cur_price = get_current_price(ticker)
-        if cur_price is None:
-            job_log(job_id, f"{ticker} price unavailable — skipping", "warn")
-            time.sleep(random.uniform(0.2, 0.5))
-            continue
-
-        # Thesis invalidated if price already broke above resistance
-        if cur_price > resistance:
-            job_log(job_id,
-                f"{ticker} price Rs{cur_price:.2f} > resistance Rs{resistance:.2f} (breakout) — skip",
-                "fail")
-            time.sleep(random.uniform(0.2, 0.4))
-            continue
-
-        dist_pct = (resistance - cur_price) / resistance * 100
-
-        # Gate 3: must be within proximity_percent of resistance
-        if dist_pct > prox_pct:
-            job_log(job_id,
-                f"{ticker} dist {dist_pct:.1f}% > {prox_pct}% proximity limit — skip",
-                "fail")
-            time.sleep(random.uniform(0.2, 0.4))
-            continue
-
-        job_log(job_id,
-            f"{ticker} ✓ in proximity {dist_pct:.1f}%  Rs{cur_price:.2f} → Rs{resistance:.2f}  "
-            f"checking volume + options...",
-            "info")
-
-        # ── Volume surge (must coincide with price TESTING resistance) ──────────
-        # KEY FIX: volume is only counted as a "resistance-zone surge" when
-        # today's HIGH is also within proximity of resistance.  This prevents
-        # falsely flagging high-volume sessions that happened far from resistance
-        # (e.g. gap-down open or early morning dump) but where LTP drifted near
-        # resistance by end of day.
-        vol_surge_ratio      = None
-        today_vol            = None
-        avg_vol_20d          = None
-        today_high           = None
-        high_near_resistance = False   # True iff today's HIGH tested resistance zone
-        high_dist_pct        = None
-
-        hist = get_price_history(ticker, 25)
-        if hist is not None and len(hist) >= 5:
-            vols       = hist["Volume"].values
-            highs_hist = hist["High"].values
-            # 20d average using candles BEFORE today
-            window = vols[-21:-1] if len(vols) >= 22 else vols[:-1]
-            avg_vol_20d = float(window.mean()) if len(window) > 0 else None
-            today_vol   = float(vols[-1])
-            today_high  = float(highs_hist[-1])
-            if avg_vol_20d and avg_vol_20d > 0:
-                vol_surge_ratio = round(today_vol / avg_vol_20d, 2)
-
-            # Check whether today's HIGH reached the resistance zone.
-            # - If high < resistance: distance must be within prox_pct
-            # - If high > resistance: intraday wick pierced/rejected at resistance
-            #   (still counts — price definitely tested that level today)
-            if today_high is not None:
-                if today_high <= resistance:
-                    high_dist_pct        = round((resistance - today_high) / resistance * 100, 2)
-                    high_near_resistance = high_dist_pct <= prox_pct
-                else:
-                    # Intraday candle wick exceeded resistance then came back → strong rejection
-                    high_dist_pct        = 0.0
-                    high_near_resistance = True
-
-        vol_label = f"{vol_surge_ratio:.2f}x" if vol_surge_ratio is not None else "N/A"
-
-        # Both conditions must hold:
-        #   1. Volume is elevated vs 20d average
-        #   2. Today's HIGH confirms price actually reached the resistance zone
-        is_vol_surge = (
-            vol_surge_ratio is not None
-            and vol_surge_ratio >= min_vol_surge
-            and high_near_resistance
-        )
-
-        high_label = (
-            f"Rs{today_high:.2f} ({high_dist_pct:.1f}% from resistance)"
-            if today_high is not None else "N/A"
-        )
-        vol_reason = (
-            "✓ HIGH VOL AT RESISTANCE"    if is_vol_surge else
-            f"⚠ vol={vol_label} OK but HIGH Rs{today_high:.2f} not near resistance ({high_dist_pct:.1f}% > {prox_pct}%)"
-                if (vol_surge_ratio is not None and vol_surge_ratio >= min_vol_surge and not high_near_resistance) else
-            f"⚠ vol={vol_label} below threshold {min_vol_surge}x"
-        )
-        job_log(job_id,
-            f"{ticker} volume @ resistance: {vol_label}  today_high={high_label}  {vol_reason}",
-            "info" if is_vol_surge else "warn")
-
-        # ── HARD GATE: skip if vol surge not confirmed at resistance ──────────
-        # Both conditions must be true before we bother fetching option chain:
-        #   • vol_surge_ratio >= min_vol_surge  (e.g. 1.5x)
-        #   • today_high within prox_pct of resistance  (price actually tested it)
-        # A 0.23x day is NOT a premium zone — CE premiums are stale/undemanded.
-        if not is_vol_surge:
-            job_log(job_id,
-                f"{ticker} SKIP — vol {vol_label} not a volume surge at resistance "                f"(threshold {min_vol_surge}x, high_near_resistance={high_near_resistance})",
-                "fail")
-            skipped_low_vol += 1
-            time.sleep(random.uniform(0.2, 0.4))
-            continue
-
-        time.sleep(random.uniform(2.0, 3.5))
-
-        # ── Option chain ─────────────────────────────────────────────────────
-        strike_map, expiry = fetch_option_chain(ticker)
-        if not strike_map:
-            job_log(job_id, f"{ticker} option chain unavailable", "fail")
-            continue
-
-        sorted_strikes = sorted(strike_map.keys())
-
-        # OTM-only: every strike strictly above current price
-        otm_strikes_pz = [s for s in sorted_strikes if s > cur_price]
-
-        # Build full OTM ladder (no ATM, no depth cap — all OTM strikes available)
-        ladder: List[Dict] = []
-        for offset, sk in enumerate(otm_strikes_pz):
-            ce_data    = strike_map[sk]
-            ce_ltp     = ce_data["CE_ltp"]
-            ce_oi      = ce_data["CE_oi"]
-            ce_chg     = ce_data.get("CE_chg")
-            ce_chg_pct = ce_data.get("CE_chg_pct")
-            ce_high        = ce_data.get("CE_high")
-            ce_high_chg_pct = ce_data.get("CE_high_chg_pct")
-            moneyness = f"+{offset+1} OTM"
-            ladder.append({
-                "strike":           sk,
-                "moneyness":        moneyness,
-                "CE_ltp":           round(ce_ltp, 2),
-                "CE_high":          round(ce_high, 2) if ce_high is not None else None,
-                "CE_oi":            ce_oi,
-                "CE_chg":           ce_chg,
-                "CE_chg_pct":       ce_chg_pct,
-                "CE_high_chg_pct":  ce_high_chg_pct,
-            })
-
-        if not ladder:
-            job_log(job_id, f"{ticker} no OTM strikes found in ladder", "fail")
-            continue
-
-        # ── Premium Score ─────────────────────────────────────────────────────
-        # Score = vol_surge_ratio × nearest_OTM_LTP (+1 OTM, the most actionable sell strike).
-        # At this point is_vol_surge is True (hard gate above), so vol_surge_ratio
-        # is guaranteed to be >= min_vol_surge.  No fallback needed.
-        # Higher score = more volume conviction at resistance + richer CE premium.
-        nearest_otm_ltp = ladder[0]["CE_ltp"]
-        premium_score   = round(vol_surge_ratio * nearest_otm_ltp, 2)
-
-        # Hottest strike: primary = highest CE_high_chg_pct; secondary = CE_chg_pct; fallback = CE_ltp
-        valid_high = [r for r in ladder if r.get("CE_high_chg_pct") is not None and r["CE_ltp"] > 0]
-        valid_pct  = [r for r in ladder if r.get("CE_chg_pct")      is not None and r["CE_ltp"] > 0]
-        valid_ltp  = [r for r in ladder if r["CE_ltp"] > 0]
-
-        if valid_high:
-            hot_rung        = max(valid_high, key=lambda r: r["CE_high_chg_pct"])
-            hot_strike_pz   = hot_rung["strike"]
-            hot_chg_pct_pz  = hot_rung["CE_chg_pct"]
-            hot_ltp_pz      = hot_rung["CE_ltp"]
-            hot_high_pz     = hot_rung["CE_high"]
-            hot_high_chg_pz = hot_rung["CE_high_chg_pct"]
-        elif valid_pct:
-            hot_rung        = max(valid_pct, key=lambda r: r["CE_chg_pct"])
-            hot_strike_pz   = hot_rung["strike"]
-            hot_chg_pct_pz  = hot_rung["CE_chg_pct"]
-            hot_ltp_pz      = hot_rung["CE_ltp"]
-            hot_high_pz     = hot_rung.get("CE_high")
-            hot_high_chg_pz = hot_rung.get("CE_high_chg_pct")
-        elif valid_ltp:
-            hot_rung        = max(valid_ltp, key=lambda r: r["CE_ltp"])
-            hot_strike_pz   = hot_rung["strike"]
-            hot_chg_pct_pz  = None
-            hot_ltp_pz      = hot_rung["CE_ltp"]
-            hot_high_pz     = hot_rung.get("CE_high")
-            hot_high_chg_pz = hot_rung.get("CE_high_chg_pct")
-        else:
-            hot_strike_pz = hot_chg_pct_pz = hot_ltp_pz = hot_high_pz = hot_high_chg_pz = None
-
-        # Best strike to SELL = first strike ABOVE resistance (existing logic)
-        suggested_strike = sig.get("Suggested_Strike")
-
-        job_log(job_id,
-            f"{ticker} PREMIUM  score={premium_score:.1f}  "
-            f"+1 OTM Rs{ladder[0]['strike']:.0f} CE={nearest_otm_ltp:.2f}  "
-            f"vol={vol_label}  "
-            f"sell_strike=Rs{suggested_strike or '?'}  expiry={expiry}",
-            "signal")
-
-        results.append({
-            "Ticker":            ticker,
-            "Current_Price":     round(cur_price, 2),
-            "Surge_High":        round(resistance, 2),
-            "Distance_Pct":      round(dist_pct, 2),
-            "Vol_Surge_Ratio":        vol_surge_ratio,
-            "Is_Vol_Surge":           is_vol_surge,
-            "Today_Volume":           int(today_vol) if today_vol else None,
-            "Avg_Vol_20d":            int(avg_vol_20d) if avg_vol_20d else None,
-            "Today_High":             round(today_high, 2) if today_high else None,
-            "High_Near_Resistance":   high_near_resistance,
-            "High_Dist_Pct":          high_dist_pct,
-            "Expiry":            expiry,
-            # Full OTM-only ladder (all strikes above cur_price)
-            "OTM_Ladder":        ladder,
-            # Nearest OTM (first in ladder) — most actionable sell candidate
-            "OTM1_Strike":       ladder[0]["strike"]              if ladder else None,
-            "OTM1_CE_LTP":       ladder[0]["CE_ltp"]              if ladder else None,
-            "OTM1_CE_High":      ladder[0].get("CE_high")         if ladder else None,
-            "OTM1_CE_OI":        ladder[0]["CE_oi"]               if ladder else None,
-            "OTM1_CE_Chg_Pct":   ladder[0].get("CE_chg_pct")      if ladder else None,
-            "OTM1_CE_High_Chg_Pct": ladder[0].get("CE_high_chg_pct") if ladder else None,
-            "Sell_Strike":       suggested_strike,
-            "Sell_CE_LTP":       sig.get("CE_LTP"),
-            "Premium_Score":     premium_score,
-            # Hottest OTM CE strike (biggest % premium surge — high-based preferred)
-            "Hot_Strike":        hot_strike_pz,
-            "Hot_CE_Chg_Pct":    hot_chg_pct_pz,
-            "Hot_CE_LTP":        hot_ltp_pz,
-            "Hot_CE_High":       hot_high_pz,
-            "Hot_CE_High_Chg_Pct": hot_high_chg_pz,
-            "Surge_Gain_Pct":    sig.get("Surge_Gain_Pct"),
-            "G2_Date":           sig.get("Sell_Zone_EMA_Confirm_Date"),
-            "Breakdown_Date":    sig.get("Breakdown_Date"),
-            "Scanned_At":        now_ist_str(),
-        })
-
-        time.sleep(random.uniform(2.0, 4.0))
-
-    # Sort by Premium Score descending (best sell opportunity first)
-    results.sort(key=lambda x: x.get("Premium_Score", 0), reverse=True)
-
-    job_log(job_id,
-        f"Premium Zone done — {len(results)} qualified candidate(s)  "        f"({skipped_low_vol} skipped: vol below {min_vol_surge}x or HIGH not at resistance)",
-        "info")
-    job_progress(job_id, len(gate2), len(gate2), "")
-    job_done(job_id, results)
-
-    return results
-
-
-# ─────────────────────────────────────────────────────────────
-#  SCHEDULER
-# ─────────────────────────────────────────────────────────────
-_scheduler: Optional[BackgroundScheduler] = None
-
-def start_scheduler(cfg: Dict):
-    global _scheduler
-    if _scheduler and _scheduler.running:
-        try:
-            _scheduler.shutdown(wait=False)
-        except Exception:
-            pass
-    _scheduler = BackgroundScheduler(timezone=IST)
-
-    def job():
-        c = load_config()
-        if c["market_hours_only"] and not is_market_open():
-            return
-        jid = create_job()
-        run_screen_job(load_tickers(), c, jid)
-        # Gate 2: check EMA+volume confirmation for all signals
-        update_sell_zone_gates(c)
-        all_sigs = load_signals()
-        if all_sigs:
-            hits = check_proximity_alerts(all_sigs, c)
-            if hits:
-                prox = load_proximity()
-                # Deduplicate within 30-min window
-                recent = {
-                    h["Ticker"] for h in prox
-                    if h.get("Alert_Time") and
-                    (datetime.now(IST) -
-                     datetime.strptime(h["Alert_Time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-                    ).total_seconds() < 1800
-                }
-                new_hits = [h for h in hits if h["Ticker"] not in recent]
-                # Also patch ladder data onto existing saved alerts that have empty ladders
-                hits_by_ticker = {h["Ticker"]: h for h in hits}
-                patched = False
-                for saved in prox:
-                    tk = saved.get("Ticker")
-                    if tk in hits_by_ticker and not saved.get("Opt_Ladder"):
-                        fresh = hits_by_ticker[tk]
-                        saved["Opt_Ladder"]     = fresh.get("Opt_Ladder", [])
-                        saved["Hot_Strike"]     = fresh.get("Hot_Strike")
-                        saved["Hot_CE_Chg_Pct"] = fresh.get("Hot_CE_Chg_Pct")
-                        saved["Hot_CE_LTP"]     = fresh.get("Hot_CE_LTP")
-                        patched = True
-                if new_hits:
-                    prox.extend(new_hits)
-                if new_hits or patched:
-                    save_proximity(prox[-200:])
-
-    interval = max(cfg.get("auto_scan_interval_min", 15), 10)
-    _scheduler.add_job(job, IntervalTrigger(minutes=interval),
-                       id="main_scan", replace_existing=True)
-    _scheduler.start()
-
-
-# ─────────────────────────────────────────────────────────────
-#  FASTAPI APP
-# ─────────────────────────────────────────────────────────────
-app = FastAPI(title="NSE Tools Suite", version="4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/option-charts", include_in_schema=False)
-async def option_charts_page():
-    return FileResponse(BASE_DIR / "static" / "option-charts.html")
-
-@app.get("/sma-screener", include_in_schema=False)
-async def sma_screener_page():
-    return FileResponse(BASE_DIR / "static" / "sma-screener.html")
-
-@app.get("/backtest", include_in_schema=False)
-async def backtest_page():
-    return FileResponse(BASE_DIR / "static" / "backtest.html")
-
-@app.get("/backtest-dashboard", include_in_schema=False)
-async def backtest_dashboard_page():
-    return FileResponse(BASE_DIR / "static" / "backtest_dashboard.html")
-
-@app.get("/ema9-screener", include_in_schema=False)
-async def ema9_screener_page():
-    return FileResponse(BASE_DIR / "static" / "ema9-screener.html")
-
-@app.get("/ema9", include_in_schema=False)
-async def ema9_screener_page():
-    return FileResponse(BASE_DIR / "static" / "ema9.html")
-
-@app.get("/fv_test_harness", include_in_schema=False)
-async def ema9_screener_page():
-    return FileResponse(BASE_DIR / "static" / "fv_test_harness.html")
-
-@app.get("/ema9_backtest", include_in_schema=False)
-async def ema9_screener_page():
-    return FileResponse(BASE_DIR / "static" / "ema9_backtest.html")
-
-#app.include_router(oc_router)
-app.include_router(sma_router)
-
-app.include_router(bt_router)
-app.include_router(ema9_router)
-app.include_router(fv_router)          # fair_value_router → /api/fv/*
-app.include_router(ema9_backtest_router)
-app.include_router(chartink_router)       # chartink_router → /api/chartink/*
-app.include_router(chartink_watch_router) # chartink_watcher → /api/chartink-screener/*
-app.include_router(near_support_router) # near_support_router → /api/near-support/*
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.include_router(scan_jobs_router)
 
 
-os.makedirs("static", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+def _read_config() -> Dict[str, Any]:
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "strategy": "3_PERCENT_EQUITY_EMA9_FAIR_VALUE",
+        "target_pct": 3.0,
+        "ema_period": 9,
+        "trend_sma_period": 50,
+        "require_uptrend": True,
+        "allow_sideways": False,
+        "max_candles_ago": 10,
+        "fair_value_enabled": True,
+        "default_ticker_source": "fno",
+    }
 
 
-# ── Pydantic schemas ──────────────────────────────────────────
-class ConfigUpdate(BaseModel):
-    lookback_days:               Optional[int]   = None
-    min_gain_percent:            Optional[float] = None
-    min_green_candles:           Optional[int]   = None
-    surge_recency_days:          Optional[int]   = None
-    min_drop_percent:            Optional[float] = None
-    min_breakdown_volume_ratio:  Optional[float] = None
-    ema_period:                  Optional[int]   = None
-    ema_filter_enabled:          Optional[bool]  = None
-    price_proximity_percent:     Optional[float] = None
-    ce_above_historical_high:    Optional[bool]  = None
-    ce_history_days:             Optional[int]   = None
-    max_signal_age_days:         Optional[int]   = None
-    auto_scan_enabled:           Optional[bool]  = None
-    auto_scan_interval_min:      Optional[int]   = None
-    market_hours_only:           Optional[bool]  = None
-    telegram_bot_token:          Optional[str]   = None
-    telegram_chat_id:            Optional[str]   = None
-    # Check 1 — Previous-Pullup-High filter
-    prev_high_filter_enabled:        Optional[bool]  = None
-    prev_high_lookback_days:         Optional[int]   = None
-    prev_high_exclude_recent_days:   Optional[int]   = None
-    prev_high_buffer_pct:            Optional[float] = None
-    # Surge gain calculation
-    surge_wick_filter_pct:            Optional[float] = None
-    surge_max_gain_pct:               Optional[float] = None
-    # Check 2 — Bear Call Spread
-    bear_call_spread_width_intervals: Optional[int]  = None
-    # Premium Sell Zone
-    premium_min_vol_surge:            Optional[float] = None
-    premium_otm_depth:                Optional[int]   = None
-    # Lifetime 52-week high filter
-    lifetime_high_filter_enabled:     Optional[bool]  = None
-    lifetime_high_lookback_days:      Optional[int]   = None
-    lifetime_high_buffer_pct:         Optional[float] = None
-    # ── Options processing master toggle (kill-switch for NSE calls) ──
-    options_processing_enabled:       Optional[bool]  = None
-    # ── Prime Target FV Gap Tolerance (relaxes undervalued-only filter) ──
-    # 0.0 = strict (cp < fv); 10.0 = allow up to 10% overvalued.
-    ema9_prime_fv_gap_pct:            Optional[float] = None
-    # ── Pullback-from-Previous-High (entry-quality filter) ──────────────
-    # Look back N days for the prior high (default 60), require ≥ threshold %
-    # pullback from that high (default 10.0). When filter_pullback=True, signals
-    # that don't meet the threshold are dropped from prime_targets/other_signals.
-    ema9_pullback_lookback_days:      Optional[int]   = None
-    ema9_pullback_threshold_pct:      Optional[float] = None
-    ema9_filter_pullback:             Optional[bool]  = None
-    # ── Volatility-Adjusted Target (per-signal target_price from ATR) ───
-    # mode="fixed" → flat 3% target (legacy). mode="atr" → per-signal target
-    # from ATR (high-vol stocks get larger targets, low-vol get smaller).
-    ema9_vol_target_mode:             Optional[str]   = None    # "fixed" | "atr"
-    ema9_vol_target_atr_period:       Optional[int]   = None
-    ema9_vol_target_multiplier:       Optional[float] = None
-    ema9_vol_target_floor_pct:        Optional[float] = None
-    ema9_vol_target_cap_pct:          Optional[float] = None
-    # ── Require Uptrend (SMA50) filter ──────────────────────────────────
-    # When True, live screener + Chartink reject 9EMA crossovers where Close ≤
-    # SMA50. When False, every 9EMA crossover is accepted (catches recovery
-    # breakouts that happen before SMA50 turns up).
-    ema9_require_uptrend:             Optional[bool]  = None
-    # ── Momentum Sweep (Chartink Live Feed) ──────────────────────────────
-    # Master toggle + filters + target % for the momentum-continuation table.
-    ema9_momentum_sweep_enabled:              Optional[bool]  = None
-    ema9_momentum_sweep_min_ema9_dist_pct:    Optional[float] = None
-    ema9_momentum_sweep_max_ema9_dist_pct:    Optional[float] = None
-    ema9_momentum_sweep_target_pct:           Optional[float] = None
-    # ── Chartink Live Feed master toggle ──
-    # When False: no auto-polling, no scan-now, frontend stops polling,
-    # AND Telegram alerts are suppressed (secondary kill-switch).
-    chartink_feed_enabled:            Optional[bool]  = None
-    chartink_enrich_near_support:     Optional[bool]  = None
+def _write_config(cfg: Dict[str, Any]) -> bool:
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        return True
+    except Exception:
+        return False
 
-class SpecificScreenRequest(BaseModel):
-    tickers: List[str]
+
+# ─────────────────────────────────────────────────────────────
+#  REQUEST SCHEMAS
+# ─────────────────────────────────────────────────────────────
+class ScreenerScanRequest(BaseModel):
+    tickers: Optional[List[str]] = None
+    source: Literal["fno", "all", "custom"] = "fno"
+    lookback_days: int = Field(365, ge=60, le=3650)
+    max_candles_ago: int = Field(10, ge=1, le=60)
+    target_pct: float = Field(3.0, gt=0, le=30, allow_inf_nan=False)
+    require_uptrend: bool = True
+    allow_sideways: bool = False
+    require_fair_value_undervalued: bool = False
+    actionable_only: bool = False
+    min_setup_score: int = Field(0, ge=0, le=100)
+    require_market_uptrend: bool = False
+    require_relative_strength: bool = False
+    enrich_watchlist: bool = False
+
+
+class BacktestRequest(BaseModel):
+    tickers: List[str] = Field(..., min_length=1)
+    years: int = Field(2, ge=1, le=5)
+    target_pct: float = Field(3.0, ge=0.5, le=20.0)
+    max_hold_candles: int = Field(20, ge=5, le=60)
+    compare_fair_value: bool = True
+    slippage_bps: float = Field(5, ge=0, le=200, allow_inf_nan=False)
+    commission_bps: float = Field(10, ge=0, le=200, allow_inf_nan=False)
+    require_uptrend: bool = True
+
+
+class DurationBacktestRequest(BaseModel):
+    tickers: List[str] = Field(..., min_length=1)
+    years: int = Field(5, ge=1, le=10)
+    target_pct: float = Field(3.0, ge=0.5, le=20, allow_inf_nan=False)
+    max_hold_sessions: int = Field(90, ge=1, le=250)
+    mode: Literal["legacy_target_study", "duration_next_open"] = "legacy_target_study"
+    require_uptrend: bool = False
+    slippage_bps: float = Field(5, ge=0, le=200, allow_inf_nan=False)
+    commission_bps: float = Field(10, ge=0, le=200, allow_inf_nan=False)
+    research_filters: bool = False
+    avoid_near_resistance: bool = False
+    require_pullback: bool = False
+    include_current_fair_value: bool = False
+
+
+class SignalSaveRequest(BaseModel):
+    ticker: str
+    entry_price: float = Field(..., gt=0, allow_inf_nan=False)
+    target_3pct: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    target_pct: float = Field(3.0, gt=0, le=100, allow_inf_nan=False)
+    stop_loss_price: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    entry_date: Optional[str] = None
+    entry_at_open: bool = False
+    stop_mode: Literal["EMA9_CLOSE", "PRICE"] = "EMA9_CLOSE"
+    max_hold_candles: int = Field(20, ge=1, le=250)
+    slippage_bps: float = Field(5, ge=0, le=200, allow_inf_nan=False)
+    commission_bps: float = Field(10, ge=0, le=200, allow_inf_nan=False)
+    breakout_date: Optional[str] = None
+    confirm_date: Optional[str] = None
+    composite_fair_price: Optional[float] = None
+    valuation_bucket: Optional[str] = None
+    notes: Optional[str] = ""
+
+
+class PositionSizeRequest(BaseModel):
+    capital: float = Field(..., gt=0, allow_inf_nan=False)
+    risk_pct: float = Field(1, gt=0, le=10, allow_inf_nan=False)
+    entry_price: float = Field(..., gt=0, allow_inf_nan=False)
+    stop_price: float = Field(..., gt=0, allow_inf_nan=False)
+    target_price: float = Field(..., gt=0, allow_inf_nan=False)
+    round_trip_cost_bps: float = Field(30, ge=0, le=500, allow_inf_nan=False)
+
+
+class RecommendedJobRequest(BaseModel):
+    source: Literal["fno", "all"] = "fno"
+    limit: int = Field(10, ge=1, le=100)
+
+
+class SwingJobRequest(BaseModel):
+    source: Literal["fno", "all"] = "fno"
+    min_upside: float = Field(15, ge=0, le=100, allow_inf_nan=False)
+    max_dist_floor: float = Field(14, gt=0, le=50, allow_inf_nan=False)
 
 
 # ─────────────────────────────────────────────────────────────
 #  ROUTES
 # ─────────────────────────────────────────────────────────────
-@app.get("/")
-async def root():
-    return FileResponse(BASE_DIR / "static" / "index.html")
 
-@app.get("/api/status")
-async def get_status():
-    cfg  = load_config()
-    sigs = load_signals()
-    prox = load_proximity()
-    log  = load_scan_log()
+@app.get("/", response_class=HTMLResponse)
+async def serve_dashboard():
+    """Serve the redesigned modern single-page equity dashboard."""
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    return HTMLResponse("<h2>Dashboard is loading...</h2>")
+
+
+@app.get("/api/health")
+async def health_check():
     return {
-        "market_open":          is_market_open(),
-        "ist_time":             datetime.now(IST).strftime("%H:%M:%S"),
-        "ist_date":             datetime.now(IST).strftime("%Y-%m-%d"),
-        "active_signals":       len(sigs),
-        "proximity_alerts":     len(prox),
-        "auto_scan":            cfg["auto_scan_enabled"],
-        "scan_interval":        cfg["auto_scan_interval_min"],
-        "last_scan":            log[-1]["time"] if log else None,
-        "options_processing":   cfg.get("options_processing_enabled", True),
-        "chartink_feed":        cfg.get("chartink_feed_enabled", True),
+        "status": "healthy",
+        "service": "Equity 9-EMA 3% Screener",
+        "version": "2.0.0",
+        "strategy": "3% Target + Aligned Fair Value",
     }
+
 
 @app.get("/api/config")
 async def get_config():
-    return load_config()
+    return _read_config()
 
-@app.put("/api/config")
-async def update_config(data: ConfigUpdate):
-    cfg     = load_config()
-    updates = {k: v for k, v in data.dict().items() if v is not None}
-    cfg.update(updates)
-    save_config(cfg)
-    # ── Keep the in-memory options toggle in sync if the caller updated it via
-    # the general /api/config endpoint (rather than the dedicated toggle).
-    if "options_processing_enabled" in updates:
-        _refresh_options_enabled_from_config()
-        print(f"[CONFIG] options_processing_enabled -> {_OPTIONS_ENABLED}")
-    # ── Keep the Chartink feed toggle in sync too.
-    if "chartink_enrich_near_support" in updates:
-        print(f"[CONFIG] chartink_enrich_near_support -> {updates['chartink_enrich_near_support']}")
-    if "chartink_feed_enabled" in updates:
-        _refresh_chartink_feed_enabled_from_config()
-        print(f"[CONFIG] chartink_feed_enabled -> {_CHARTINK_FEED_ENABLED}")
-    if cfg["auto_scan_enabled"]:
-        start_scheduler(cfg)
-    return cfg
 
-# ─────────────────────────────────────────────────────────────
-#  OPTIONS PROCESSING TOGGLE  (kill-switch for NSE option-chain calls)
-# ─────────────────────────────────────────────────────────────
-# When disabled, fetch_option_chain() returns (None, "options_disabled_by_user")
-# immediately — no NSE HTTP traffic. The auto-scheduler still runs but every
-# options-fetching path (find_best_strike, check_proximity_alerts,
-# _do_refresh_ladders, scan_premium_zone_job) becomes a no-op. This frees the
-# scheduler thread + requests session pool for Chartink Live Feed and
-# yfinance downloads. Toggle is persisted in config.json so it survives restarts.
+@app.post("/api/config")
+async def update_config(cfg: Dict[str, Any] = Body(...)):
+    current = _read_config()
+    current.update(cfg)
+    if _write_config(current):
+        return {"status": "success", "config": current}
+    raise HTTPException(500, "Failed to save configuration")
 
-class OptionsToggleRequest(BaseModel):
-    enabled: Optional[bool] = None
 
-@app.get("/api/options/toggle")
-async def get_options_toggle():
-    """Return current options-processing state + how many callers would be affected."""
+@app.get("/api/screener/tickers")
+async def api_tickers(source: str = "fno", q: str = "", limit: int = 50):
+    """Return autocomplete ticker suggestions with company names."""
+    results = get_tickers_list(source, q, limit)
+    total_reg = len(load_ticker_registry(source))
+    return {"total": total_reg, "tickers": results}
+
+
+@app.post("/api/screener/scan")
+async def api_screener_scan(req: ScreenerScanRequest):
+    """
+    Run the 9-EMA equity screener across selected tickers or universe.
+    Returns prime targets (confluence), technical signals, and full stats.
+    """
+    try:
+        results = await run_ema9_screener(
+            tickers=req.tickers,
+            source=req.source,
+            lookback_days=req.lookback_days,
+            max_candles_ago=req.max_candles_ago,
+            target_pct=req.target_pct,
+            require_uptrend=req.require_uptrend,
+            allow_sideways=req.allow_sideways,
+            require_fair_value_undervalued=req.require_fair_value_undervalued,
+            actionable_only=req.actionable_only,
+            min_setup_score=req.min_setup_score,
+            require_market_uptrend=req.require_market_uptrend,
+            require_relative_strength=req.require_relative_strength,
+            enrich_watchlist=req.enrich_watchlist,
+        )
+        return results
+    except Exception as e:
+        raise HTTPException(500, f"Screener execution error: {e}")
+
+
+@app.get("/api/screener/quick-recommended")
+async def api_quick_recommended(source: Literal["fno", "all"] = "fno", limit: int = Query(10, ge=1, le=100)):
+    return await _recommended_scan(source, limit)
+
+
+async def _recommended_scan(source: str, limit: int, progress=None):
+    """
+    Fast query for currently recommended 3% picks:
+    Uptrend + Confirmed 9-EMA Breakout + Undervalued vs Fair Value.
+    """
+    try:
+        # Use top liquid leaders for instant initial response
+        sample_tickers = load_ticker_registry(source)["symbol"].head(60).tolist()
+        scan_res = await run_ema9_screener(
+            tickers=sample_tickers,
+            source=source,
+            lookback_days=365,
+            max_candles_ago=10,
+            target_pct=3.0,
+            require_uptrend=True,
+            progress=progress,
+        )
+        prime = scan_res.get("prime_targets", [])
+        return {
+            "recommended": prime[:limit],
+            "total_prime": len(prime),
+            "scanned_count": len(sample_tickers),
+            "universe_size": len(load_ticker_registry(source)),
+            "scan_scope": "First 60 symbols in the selected registry; use full screener for all symbols",
+            "market_context": scan_res.get("market_context"),
+            "technical_only": scan_res.get("technical_only", [])[:limit],
+            "watchlist": scan_res.get("watchlist", [])[:limit],
+            "data_failures": scan_res.get("data_failures", []),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Quick recommended scan error: {e}")
+
+
+@app.get("/api/fair-value/{ticker}")
+async def api_fair_value(ticker: str, fy_start: int = 2014, force: bool = False):
+    """Get complete Fair Value valuation model breakdown for a ticker."""
+    try:
+        fv = await asyncio.to_thread(compute_fair_value, ticker, fy_start, force)
+        return fv
+    except Exception as e:
+        raise HTTPException(500, f"Fair Value calculation error: {e}")
+
+
+@app.post("/api/position-size")
+async def api_position_size(req: PositionSizeRequest):
+    """Size whole-share, unlevered entries using a user-selected loss budget."""
+    if req.stop_price >= req.entry_price or req.target_price <= req.entry_price:
+        raise HTTPException(400, "Long positions require stop < entry < target")
+    cost = req.entry_price * req.round_trip_cost_bps / 10000
+    unit_risk = req.entry_price - req.stop_price + cost
+    unit_reward = req.target_price - req.entry_price - cost
+    risk_budget = req.capital * req.risk_pct / 100
+    risk_quantity = int(risk_budget // unit_risk)
+    # Reserve the estimated transaction cost instead of exceeding available cash.
+    cash_quantity = int(req.capital // (req.entry_price + cost))
+    quantity = max(0, min(risk_quantity, cash_quantity))
+    return {"quantity": quantity, "capital_required": round(quantity * (req.entry_price + cost), 2),
+            "position_value": round(quantity * req.entry_price, 2),
+            "risk_budget": round(risk_budget, 2), "max_loss": round(quantity * unit_risk, 2),
+            "potential_net_gain": round(quantity * unit_reward, 2),
+            "net_reward_risk": round(unit_reward / unit_risk, 2),
+            "estimated_cost": round(quantity * cost, 2),
+            "limiting_factor": "risk_budget" if risk_quantity <= cash_quantity else "available_cash",
+            "assumption": "Estimated stop fill; overnight gaps and EMA close exits can exceed the loss budget"}
+
+
+@app.get("/api/analysis/{ticker}")
+async def api_stock_analysis(ticker: str, include_valuation: bool = False):
+    """Useful stock diagnostics even when no recent breakout is present."""
+    sym = normalize_ticker(ticker)
+    df = await _load_completed_history(sym, 400)
+    indicators = indicator_frame(df)
+    row = indicators.iloc[-1]
+    numeric = lambda x: round(float(x), 4) if pd.notna(x) and np.isfinite(x) else None
+    price = float(row.Close)
+    setup = analyze_ticker_ema9(sym, df, 30)
+    fv = (await asyncio.to_thread(compute_fair_value, sym, current_price=price)
+          if include_valuation else get_cached_fair_value(sym, current_price=price)) or {}
+    reversal = await asyncio.to_thread(analyze_stock_swing_reversal, sym, df,
+                                       min_upside_pct=0, max_dist_to_floor_pct=25,
+                                       include_fair_value=False)
+    return {"ticker": sym, "as_of": str(df.index[-1].date()), "current_price": price,
+            "trend": compute_trend(df),
+            "indicators": {key: numeric(row[key]) for key in
+                           ("ema9", "sma50", "sma200", "atr14", "rsi14", "volume_ratio", "turnover20")},
+            "range_52week": {"high": numeric(df.High.iloc[-252:].max()),
+                             "low": numeric(df.Low.iloc[-252:].min()),
+                             "sessions_available": min(len(df), 252)},
+            "returns_pct": {str(n): numeric((price / df.Close.iloc[-n-1] - 1) * 100)
+                            if len(df) > n else None for n in (5, 20, 60, 120)},
+            "ema_setup": {k: v for k, v in (setup or {}).items() if k != "candles"} or None,
+            "swing_setup": reversal, "fair_value": {k: fv.get(k) for k in
+                ("composite_fair_price", "composite_gain_pct", "valuation_confidence", "valuation_as_of",
+                 "valuation_warnings", "model_count", "model_dispersion_pct")},
+            "completed_candles_only": True, "history_bars": len(df),
+            "data_source": df.attrs.get("data_source"),
+            "history_warnings": (df.attrs.get("history_warnings", []) +
+                ([f"Only {len(df)} completed daily bars are available; EMA breakout confirmation needs 31 and a verified long-term trend needs 200."] if len(df) < 200 else [])),
+            "valuation_status": "available" if fv else "deferred",
+            "valuation_note": "Open Valuation for full fundamental analysis; price research does not wait for valuation downloads." if not fv else None}
+
+
+async def _load_completed_history(ticker: str, lookback_days: int):
+    try:
+        df = await asyncio.to_thread(fetch_ticker_ohlcv, ticker, "1d", lookback_days,
+                                      min_bars=1, allow_cached_shorter=True, raise_on_error=True)
+    except HistoryUnavailableError as exc:
+        raise HTTPException(503, f"Price history is temporarily unavailable for {ticker}. {exc} Retry the chart or check your internet connection.")
+    df = clean_ohlcv(df)
+    if df.empty:
+        raise HTTPException(503, f"Price data is temporarily unavailable for {ticker}; no completed valid candles were returned. Retry or check your internet connection.")
+    return df
+
+
+@app.post("/api/backtest/run")
+async def api_backtest_run(req: BacktestRequest):
+    """
+    Execute walk-forward backtest across historical daily bars.
+    Returns full stats, equity curve, monthly breakdown, and trade log.
+    """
+    try:
+        res = await run_equity_backtest(
+            tickers=req.tickers,
+            years=req.years,
+            target_pct=req.target_pct,
+            max_hold_candles=req.max_hold_candles,
+            compare_fair_value=req.compare_fair_value,
+            slippage_bps=req.slippage_bps,
+            commission_bps=req.commission_bps,
+            require_uptrend=req.require_uptrend,
+        )
+        return res
+    except Exception as e:
+        raise HTTPException(500, f"Backtest execution error: {e}")
+
+
+@app.post("/api/backtest/duration")
+async def api_duration_backtest(req: DurationBacktestRequest):
+    """Separate no-stop target study and next-open duration simulation."""
+    try:
+        return await run_duration_backtest(**req.model_dump())
+    except Exception as e:
+        raise HTTPException(500, f"Duration study error: {e}")
+
+
+@app.get("/api/backtest/presets")
+async def api_backtest_presets():
+    """Return standard ticker presets for easy one-click backtesting."""
+    fno_df = load_ticker_registry("fno")
+    fno_tickers = fno_df["symbol"].tolist() if not fno_df.empty else []
+
+    top_20 = [
+        "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "BHARTIARTL",
+        "SBIN", "ITC", "HINDUNILVR", "LT", "BAJFINANCE", "TATAMOTORS",
+        "SUNPHARMA", "TITAN", "MARUTI", "AXISBANK", "ONGC", "NTPC",
+        "KALYANKJIL", "DIXON"
+    ]
+
     return {
-        "enabled":             is_options_processing_enabled(),
-        "cached_in_memory":    _OPTIONS_ENABLED,
-        "note":                "When disabled, all NSE option-chain calls short-circuit immediately.",
-        "affected_endpoints":  [
-            "POST /api/screen/all",
-            "POST /api/screen/specific",
-            "POST /api/proximity/check",
-            "POST /api/proximity/refresh-ladders",
-            "POST /api/premium-zone/scan",
-            "scheduler.job() (auto-scan every N min)",
-        ],
+        "presets": [
+            {"name": "Top 20 Liquid Leaders", "tickers": top_20},
+            {"name": "Full F&O Universe (~200)", "tickers": fno_tickers[:200]},
+            {"name": "Banking & Financials", "tickers": ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "BAJFINANCE"]},
+            {"name": "IT & Tech Growth", "tickers": ["TCS", "INFY", "WIPRO", "HCLTECH", "PERSISTENT", "COFORGE"]},
+        ]
     }
 
-@app.put("/api/options/toggle")
-async def set_options_toggle(req: OptionsToggleRequest):
-    """Flip the options-processing master switch. Persists to config.json."""
-    if req.enabled is None:
-        raise HTTPException(400, "Field 'enabled' (bool) is required")
-    cfg = load_config()
-    cfg["options_processing_enabled"] = bool(req.enabled)
-    save_config(cfg)
-    # Update in-memory flag IMMEDIATELY — no FastAPI restart needed.
-    _refresh_options_enabled_from_config()
-    state = "ENABLED" if _OPTIONS_ENABLED else "DISABLED"
-    print(f"[OPTIONS] Master switch -> {state}")
-    return {
-        "ok":      True,
-        "enabled": _OPTIONS_ENABLED,
-        "message": f"Options processing is now {state}. "
-                   + ("NSE option-chain calls will resume." if _OPTIONS_ENABLED
-                      else "All NSE option-chain calls are short-circuited; "
-                           "Chartink Live Feed + yfinance will get full HTTP pool."),
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-#  CHARTINK LIVE FEED TOGGLE  (master switch for Chartink polling + alerts)
-# ─────────────────────────────────────────────────────────────
-# When disabled:
-#   • start_chartink_scheduler() is NOT called on server boot
-#   • PUT endpoint tries to call stop_chartink_scheduler() at runtime (if the
-#     watcher module exposes one) to halt the already-running scheduler
-#   • send_telegram() is suppressed (kill-switch #2 above)
-#   • Frontend stops its 5-min polling timer + disables the "Scan Now" button
-# Toggle is persisted in config.json so it survives server restarts.
-
-class ChartinkFeedToggleRequest(BaseModel):
-    enabled: Optional[bool] = None
-
-# Try to import stop_chartink_scheduler from chartink_watcher — if the module
-# exposes it, we can halt the scheduler at runtime without a server restart.
-# If it doesn't, we set the flag and the frontend stops polling, but the
-# backend scheduler keeps running harmlessly (its cached results are just
-# ignored until the user restarts the server or toggles back ON).
-try:
-    from chartink_watcher import stop_chartink_scheduler as _stop_chartink_scheduler_fn
-    _HAS_CHARTINK_STOP_FN = True
-    print("[STARTUP] chartink_watcher.stop_chartink_scheduler() imported — runtime stop available")
-except ImportError:
-    _stop_chartink_scheduler_fn = None
-    _HAS_CHARTINK_STOP_FN = False
-    print("[STARTUP] chartink_watcher.stop_chartink_scheduler() not found — "
-          "runtime stop will use flag-only mode (restart server to fully halt scheduler)")
-
-@app.get("/api/chartink-feed/toggle")
-async def get_chartink_feed_toggle():
-    """Return current Chartink Live Feed state + what's affected."""
-    return {
-        "enabled":            is_chartink_feed_enabled(),
-        "cached_in_memory":   _CHARTINK_FEED_ENABLED,
-        "runtime_stop_available": _HAS_CHARTINK_STOP_FN,
-        "note":               "When disabled: no auto-polling, no Scan Now, "
-                              "frontend stops polling, AND Telegram alerts are suppressed.",
-        "affected_endpoints": [
-            "POST /api/chartink-screener/scan-now",
-            "GET /api/chartink-screener/results (frontend polling stops)",
-            "scheduler: chartink auto-poll every 5 min",
-            "send_telegram() — secondary kill-switch",
-        ],
-    }
-
-@app.put("/api/chartink-feed/toggle")
-async def set_chartink_feed_toggle(req: ChartinkFeedToggleRequest):
-    """Flip the Chartink Live Feed master switch. Persists to config.json."""
-    if req.enabled is None:
-        raise HTTPException(400, "Field 'enabled' (bool) is required")
-    cfg = load_config()
-    cfg["chartink_feed_enabled"] = bool(req.enabled)
-    save_config(cfg)
-    # Update in-memory flag IMMEDIATELY
-    _refresh_chartink_feed_enabled_from_config()
-    state = "ENABLED" if _CHARTINK_FEED_ENABLED else "DISABLED"
-    print(f"[CHARTINK] Live Feed master switch -> {state}")
-
-    # If toggling OFF at runtime, try to stop the scheduler.
-    # If toggling ON at runtime, try to (re)start it.
-    action_msg = ""
-    if not _CHARTINK_FEED_ENABLED:
-        if _HAS_CHARTINK_STOP_FN:
-            try:
-                _stop_chartink_scheduler_fn()
-                action_msg = "Scheduler stopped at runtime."
-            except Exception as e:
-                action_msg = f"Scheduler stop failed ({e}) — flag set, restart server to fully halt."
-        else:
-            action_msg = "Flag set. Frontend will stop polling. Restart server to fully halt the backend scheduler."
-    else:
-        # Toggling ON — try to (re)start the scheduler
-        try:
-            start_chartink_scheduler()
-            action_msg = "Scheduler started at runtime."
-        except Exception as e:
-            action_msg = f"Scheduler start failed ({e}) — flag set, restart server to activate."
-
-    return {
-        "ok":      True,
-        "enabled": _CHARTINK_FEED_ENABLED,
-        "message": f"Chartink Live Feed is now {state}. {action_msg}",
-    }
-
-
-@app.get("/api/tickers")
-async def get_tickers():
-    return {"tickers": load_tickers()}
-
-@app.post("/api/tickers/upload")
-async def upload_tickers(file: UploadFile = File(...)):
-    content = await file.read()
-    df = pd.read_csv(io.BytesIO(content))
-    if "SYMBOL" not in df.columns:
-        raise HTTPException(400, "CSV must have a SYMBOL column")
-    df.to_csv(TICKERS_FILE, index=False)
-    tickers = [str(s).strip().upper() for s in df["SYMBOL"].dropna()]
-    return {"count": len(tickers), "tickers": tickers[:20]}
 
 @app.get("/api/signals")
-async def get_signals():
-    return load_signals()
+async def api_get_signals():
+    """Get all saved signals and current portfolio summary."""
+    signals = load_signals()
+    summary = get_signals_summary()
+    return {"signals": signals, "summary": summary}
 
-@app.delete("/api/signals")
-async def clear_signals():
-    _wj(SIGNALS_FILE, [])
-    _wj(PROXIMITY_FILE, [])
-    return {"ok": True}
 
-@app.get("/api/signals/gate-status")
-async def get_gate_status():
-    """Returns per-ticker gate status (Gates 1/2/3) for dashboard display."""
-    sigs      = load_signals()
-    cfg       = load_config()
-    prox_pct  = cfg.get("price_proximity_percent", 8.0)
-    result    = []
-    for sig in sigs:
-        ticker     = sig["Ticker"]
-        resistance = (
-            sig.get("Surge_High")
-            or sig.get("Yesterday_High")
-            or sig.get("Suggested_Strike")
-        )
-        cur_price  = None
-        dist_pct   = None
-        gate3      = False
-        try:
-            cur_price = get_current_price(ticker)
-            if cur_price and resistance and cur_price <= resistance:
-                dist_pct = round((resistance - cur_price) / resistance * 100, 2)
-                gate3 = dist_pct <= prox_pct
-        except Exception:
-            pass
-        result.append({
-            "ticker":                    ticker,
-            "gate1":                     True,  # Signal exists = Gate 1 passed
-            "gate2":                     bool(sig.get("Sell_Zone_EMA_Confirmed")),
-            "gate2_date":                sig.get("Sell_Zone_EMA_Confirm_Date"),
-            "gate3":                     gate3,
-            "current_price":             cur_price,
-            "resistance":                resistance,
-            "distance_pct":              dist_pct,
-            "breakdown_date":            sig.get("Breakdown_Date"),
-        })
-    return result
+@app.post("/api/signals")
+async def api_save_signal(sig: SignalSaveRequest):
+    """Save or update a tracked signal."""
+    data = sig.model_dump(exclude_none=True)
+    try:
+        updated_signals = add_or_update_signal(data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"status": "saved", "signals": updated_signals}
+
 
 @app.delete("/api/signals/{ticker}")
-async def remove_signal(ticker: str):
-    sigs = [s for s in load_signals() if s["Ticker"] != ticker.upper()]
-    save_signals(sigs)
-    return {"ok": True, "remaining": len(sigs)}
-
-@app.get("/api/proximity")
-async def get_proximity():
-    return load_proximity()
-
-@app.delete("/api/proximity")
-async def clear_proximity():
-    save_proximity([])
-    return {"ok": True}
-
-@app.post("/api/proximity/check")
-async def check_proximity():
-    sigs = load_signals()
-    if not sigs:
-        return {"hits": 0, "alerts": [], "gate2_confirmed": 0}
-    cfg  = load_config()
-    # Gate 2: update EMA+volume confirmation before checking proximity
-    gate2_new = await asyncio.to_thread(update_sell_zone_gates, cfg)
-    sigs = load_signals()  # reload after gate2 update
-    hits = await asyncio.to_thread(check_proximity_alerts, sigs, cfg)
-    if hits:
-        prox   = load_proximity()
-        recent = {
-            h["Ticker"] for h in prox
-            if h.get("Alert_Time") and
-            (datetime.now(IST) -
-             datetime.strptime(h["Alert_Time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-            ).total_seconds() < 1800
-        }
-        new_hits = [h for h in hits if h["Ticker"] not in recent]
-        # Also patch ladder data onto existing saved alerts that have empty ladders
-        hits_by_ticker = {h["Ticker"]: h for h in hits}
-        patched = False
-        for saved in prox:
-            tk = saved.get("Ticker")
-            if tk in hits_by_ticker and not saved.get("Opt_Ladder"):
-                fresh = hits_by_ticker[tk]
-                saved["Opt_Ladder"]     = fresh.get("Opt_Ladder", [])
-                saved["Hot_Strike"]     = fresh.get("Hot_Strike")
-                saved["Hot_CE_Chg_Pct"] = fresh.get("Hot_CE_Chg_Pct")
-                saved["Hot_CE_LTP"]     = fresh.get("Hot_CE_LTP")
-                patched = True
-        if new_hits:
-            prox.extend(new_hits)
-        if new_hits or patched:
-            save_proximity(prox[-200:])
-        hits = new_hits
-    return {"hits": len(hits), "alerts": hits, "gate2_confirmed": gate2_new}
-
-def _do_refresh_ladders() -> dict:
-    """
-    Synchronous worker — runs in a thread via asyncio.to_thread so it does NOT
-    block the FastAPI event loop or the NSE session used by other endpoints.
-    Only fetches unique tickers (deduped) to minimise NSE calls.
-    """
-    alerts = load_proximity()
-    if not alerts:
-        return {"ok": True, "updated": 0, "total": 0, "message": "No saved alerts to refresh"}
-
-    # Dedup: only fetch each ticker once, then patch all alerts for that ticker
-    seen_tickers: Dict[str, dict] = {}   # ticker -> {"ladder", "hot_strike", ...}
-    for alert in alerts:
-        ticker = alert.get("Ticker")
-        if not ticker or ticker in seen_tickers:
-            continue
-        cur_price = alert.get("Current_Price") or 0
-        try:
-            sm, _ = fetch_option_chain(ticker)
-            if not sm:
-                print(f"[refresh-ladders] {ticker}: option chain empty")
-                seen_tickers[ticker] = None   # mark as attempted
-                continue
-
-            sorted_sk = sorted(sm.keys())
-            atm_sk    = min(sorted_sk, key=lambda k: abs(k - cur_price))
-            atm_idx   = sorted_sk.index(atm_sk)
-
-            ladder: List[Dict] = []
-            for off in range(5):
-                sidx = atm_idx + off
-                if sidx >= len(sorted_sk):
-                    break
-                sk    = sorted_sk[sidx]
-                sdata = sm[sk]
-                ladder.append({
-                    "strike":    sk,
-                    "moneyness": "ATM" if off == 0 else f"+{off}",
-                    "ltp":       sdata["CE_ltp"],
-                    "chg":       sdata.get("CE_chg"),
-                    "chg_pct":   sdata.get("CE_chg_pct"),
-                    "prev":      sdata.get("CE_prev"),
-                    "oi":        sdata["CE_oi"],
-                })
-
-            with_pct = [r for r in ladder if r["chg_pct"] is not None and r["ltp"] > 0]
-            with_ltp = [r for r in ladder if r["ltp"] > 0]
-            if with_pct:
-                hottest = max(with_pct, key=lambda r: r["chg_pct"])
-            elif with_ltp:
-                hottest = max(with_ltp, key=lambda r: r["ltp"])
-            else:
-                hottest = None
-
-            seen_tickers[ticker] = {
-                "ladder":    ladder,
-                "hot_strike":  hottest["strike"]         if hottest else None,
-                "hot_chg_pct": hottest.get("chg_pct")   if hottest else None,
-                "hot_ltp":     hottest["ltp"]            if hottest else None,
-            }
-            print(f"[refresh-ladders] {ticker}: hot={seen_tickers[ticker]['hot_strike']}  chg%={seen_tickers[ticker]['hot_chg_pct']}")
-            time.sleep(random.uniform(2.0, 3.0))
-        except Exception as e:
-            print(f"[refresh-ladders] {ticker} error: {e}")
-            seen_tickers[ticker] = None
-            continue
-
-    # Patch all alerts with fresh data
-    updated = 0
-    refreshed_at = now_ist_str()
-    for alert in alerts:
-        tk = alert.get("Ticker")
-        data = seen_tickers.get(tk)
-        if data:
-            alert["Opt_Ladder"]          = data["ladder"]
-            alert["Hot_Strike"]          = data["hot_strike"]
-            alert["Hot_CE_Chg_Pct"]      = data["hot_chg_pct"]
-            alert["Hot_CE_LTP"]          = data["hot_ltp"]
-            alert["Ladder_Refreshed_At"] = refreshed_at
-            updated += 1
-
-    save_proximity(alerts)
-    return {"ok": True, "updated": updated, "total": len(alerts)}
+async def api_delete_signal(ticker: str):
+    """Remove a tracked signal."""
+    updated = delete_signal(ticker)
+    return {"status": "deleted", "signals": updated}
 
 
-@app.post("/api/proximity/refresh-ladders")
-async def refresh_proximity_ladders(background_tasks: BackgroundTasks):
-    """
-    On-demand only — triggered manually via the ⚡ Refresh Ladders button.
-    Runs in a background thread so NSE HTTP calls do NOT block the event loop
-    or interfere with other in-flight requests.
-    Returns immediately; client should reload alerts after a short delay.
-    """
-    alerts = load_proximity()
-    if not alerts:
-        return {"ok": True, "updated": 0, "total": 0, "message": "No saved alerts"}
-    background_tasks.add_task(asyncio.to_thread, _do_refresh_ladders)
-    unique = len({a.get("Ticker") for a in alerts if a.get("Ticker")})
-    return {"ok": True, "queued": True, "unique_tickers": unique,
-            "message": f"Refreshing {unique} ticker(s) in background"}
+@app.delete("/api/signals")
+async def api_clear_signals():
+    """Clear all saved signals."""
+    clear_signals()
+    return {"status": "cleared"}
 
 
+@app.post("/api/signals/refresh")
+async def api_refresh_signals():
+    """Refresh live quotes and mark-to-market status for active signals."""
+    refreshed = await refresh_active_signals()
+    summary = get_signals_summary()
+    return {"status": "refreshed", "signals": refreshed, "summary": summary}
 
-@app.post("/api/screen/all")
-async def screen_all(background_tasks: BackgroundTasks):
-    cfg     = load_config()
-    tickers = load_tickers()
-    job_id  = create_job()
-    background_tasks.add_task(asyncio.to_thread, run_screen_job, tickers, cfg, job_id)
-    return {"job_id": job_id, "total": len(tickers)}
-
-@app.post("/api/screen/specific")
-async def screen_specific(req: SpecificScreenRequest, background_tasks: BackgroundTasks):
-    cfg     = load_config()
-    tickers = [t.strip().upper() for t in req.tickers if t.strip()]
-    job_id  = create_job()
-    background_tasks.add_task(asyncio.to_thread, run_screen_job, tickers, cfg, job_id)
-    return {"job_id": job_id, "total": len(tickers)}
-
-@app.get("/api/jobs/{job_id}/stream")
-async def job_stream(job_id: str):
-    async def event_gen():
-        sent = 0
-        while True:
-            with jobs_lock:
-                job = jobs.get(job_id)
-            if job is None:
-                yield f"data: {json.dumps({'type':'error','msg':'Job not found'})}\n\n"
-                break
-            logs = job.get("logs", [])
-            for entry in logs[sent:]:
-                yield f"data: {json.dumps({'type':'log','time':entry['time'],'msg':entry['msg'],'level':entry['level']})}\n\n"
-            sent = len(logs)
-            yield f"data: {json.dumps({'type':'progress','current':job['progress'],'total':job['total'],'ticker':job.get('current_ticker','')})}\n\n"
-            if job["status"] in ("done", "error"):
-                yield f"data: {json.dumps({'type':'done','status':job['status'],'count':len(job.get('result',[]))})}\n\n"
-                break
-            await asyncio.sleep(0.6)
-
-    return StreamingResponse(event_gen(), media_type="text/event-stream",
-                              headers={"Cache-Control": "no-cache",
-                                       "X-Accel-Buffering": "no"})
-
-@app.get("/api/jobs/{job_id}")
-async def get_job(job_id: str):
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    return job
 
 @app.get("/api/chart/{ticker}")
-async def get_chart_data(ticker: str, days: int = 60):
-    hist = await asyncio.to_thread(get_price_history, ticker.upper(), days)
-    if hist is None or hist.empty:
-        raise HTTPException(404, f"No data for {ticker}")
+async def api_chart_data(ticker: str, lookback_days: int = Query(365, ge=30, le=3650), trade_id: Optional[str] = None):
+    """
+    Get daily candlestick bars with 9-EMA, 50-SMA, 3% Target line,
+    and Stop Loss line for lightweight charting.
+    """
+    sym = normalize_ticker(ticker)
+    df = indicator_frame(await _load_completed_history(sym, max(365, lookback_days)))
 
-    signals = load_signals()
-    sig = next((s for s in signals if s["Ticker"] == ticker.upper()), None)
+    current_price = round(float(df["Close"].iloc[-1]), 2)
+    current_ema9 = round(float(df["ema9"].iloc[-1]), 2)
+    target_price = round(current_price * 1.03, 2)
+    stop_price = current_ema9
+    setup = analyze_ticker_ema9(sym, df)
+    target_basis = "new_entry_estimate_from_latest_completed_close"
+    if setup:
+        target_price = setup["target_3pct"]
+        target_basis = setup["entry_basis"]
+    if trade_id:
+        saved = next((s for s in load_signals() if s.get("trade_id") == trade_id and normalize_ticker(s.get("ticker")) == sym), None)
+        if saved is None:
+            raise HTTPException(404, "Tracked entry does not exist for this ticker")
+    else:
+        saved = next((s for s in load_signals() if normalize_ticker(s.get("ticker")) == sym and s.get("status") in ("ACTIVE", "STOP_PENDING", "TIME_EXIT_PENDING")), None)
+    if saved:
+        target_price = saved.get("target_3pct") or target_price
+        stop_price = (saved.get("stop_loss_price") or stop_price) if saved.get("stop_mode") == "PRICE" else current_ema9
+        target_basis = "saved_trade_entry"
 
-    data = []
-    for idx, row in hist.iterrows():
-        data.append({
-            "date":   idx.strftime("%Y-%m-%d"),
-            "open":   round(float(row["Open"]),   2),
-            "high":   round(float(row["High"]),   2),
-            "low":    round(float(row["Low"]),    2),
-            "close":  round(float(row["Close"]),  2),
+    candles = []
+    for idx, row in df.iterrows():
+        d_str = str(idx.date()) if hasattr(idx, "date") else str(idx)[:10]
+        candles.append({
+            "time": d_str,
+            "open": round(float(row["Open"]), 2),
+            "high": round(float(row["High"]), 2),
+            "low": round(float(row["Low"]), 2),
+            "close": round(float(row["Close"]), 2),
             "volume": int(row.get("Volume", 0)),
+            "ema9": round(float(row["ema9"]), 2) if not pd.isna(row["ema9"]) else None,
+            "sma50": round(float(row["sma50"]), 2) if not pd.isna(row["sma50"]) else None,
         })
+
+    fv = get_cached_fair_value(sym, current_price=current_price) or {}
 
     return {
-        "ticker":          ticker.upper(),
-        "strike":          sig.get("Suggested_Strike")  if sig else None,
-        "surge_high":      sig.get("Surge_High")        if sig else None,  # TRUE resistance (surge peak)
-        "yesterday_high":  sig.get("Yesterday_High")    if sig else None,  # Day before breakdown
-        "surge_start":     sig.get("Surge_Start")       if sig else None,  # for surge highlight
-        "surge_end":       sig.get("Surge_End")         if sig else None,
-        "candles":         data,
+        "ticker": sym,
+        "current_price": current_price,
+        "ema9": current_ema9,
+        "target_3pct": target_price,
+        "stop_loss": stop_price,
+        "fair_value": fv.get("composite_fair_price"),
+        "valuation_bucket": fv.get("valuation_bucket", "N/A"),
+        "valuation_confidence": fv.get("valuation_confidence", "unavailable"),
+        "valuation_status": "cached" if fv else "deferred",
+        "target_basis": target_basis,
+        "tracked_entry": {k: saved.get(k) for k in ("trade_id", "entry_date", "entry_price", "target_pct", "status", "stop_mode", "exit_date", "exit_price")} if saved else None,
+        "setup": {k: v for k, v in (setup or {}).items() if k != "candles"},
+        "as_of": str(df.index[-1].date()),
+        "candles": candles,
     }
 
 
 # ─────────────────────────────────────────────────────────────
-#  PREMIUM SELL ZONE ROUTES
-# ─────────────────────────────────────────────────────────────
-@app.get("/api/premium-zone")
-async def get_premium_zone_data():
-    """Return the last saved Premium Zone scan results."""
-    return load_premium_zone()
-
-
-@app.post("/api/premium-zone/scan")
-async def start_premium_zone_scan(background_tasks: BackgroundTasks):
-    """
-    Launch a background Premium Zone scan.
-    Returns a job_id for SSE streaming (reuses existing /api/jobs/{id}/stream).
-    Results are saved to premium_zone.json when the job completes.
-    """
-    cfg    = load_config()
-    job_id = create_job()
-
-    async def _run():
-        results = await asyncio.to_thread(scan_premium_zone_job, cfg, job_id)
-        save_premium_zone(results)
-
-    background_tasks.add_task(_run)
-    return {"job_id": job_id}
-
-
-@app.delete("/api/premium-zone")
-async def clear_premium_zone():
-    """Clear saved Premium Zone results."""
-    save_premium_zone([])
-    return {"ok": True}
-
-
-# ─────────────────────────────────────────────────────────────
-#  P&L TRACKER ROUTES
-#  Tracks per-signal entry (CE sold) and marks-to-market daily.
-#  trade_id  = Ticker + "_" + Suggested_Strike + "_" + Expiry
+#  15%+ SWING REVERSAL & DEEP SUPPORT ENGINE ENDPOINTS
 # ─────────────────────────────────────────────────────────────
 
-class PnLEntryRequest(BaseModel):
-    ticker:        str
-    strike:        float
-    expiry:        str               # "DD-Mon-YYYY"
-    entry_ltp:     float             # CE LTP when position was entered
-    lots:          Optional[int]     = 1
-    lot_size:      Optional[int]     = 1   # NSE lot size for the stock
-    notes:         Optional[str]     = ""
-
-class PnLMarkRequest(BaseModel):
-    trade_id: str
-    current_ltp: float               # live CE LTP for mark-to-market
-
-
-def _make_trade_id(ticker: str, strike: float, expiry: str) -> str:
-    return f"{ticker.upper()}_{int(strike)}_{expiry.replace(' ', '')}"
-
-
-def _mtm_pnl(entry_ltp: float, current_ltp: float, lots: int, lot_size: int) -> Dict:
-    """Return P&L metrics for a short CE position."""
-    pnl_per_unit  = entry_ltp - current_ltp      # short CE: profit when LTP falls
-    total_qty     = lots * lot_size
-    gross_pnl     = round(pnl_per_unit * total_qty, 2)
-    pnl_pct       = round((pnl_per_unit / entry_ltp) * 100, 2) if entry_ltp > 0 else 0.0
-    return {
-        "pnl_per_unit":  round(pnl_per_unit, 2),
-        "gross_pnl":     gross_pnl,
-        "pnl_pct":       pnl_pct,
-        "total_qty":     total_qty,
-    }
-
-
-@app.get("/api/pnl")
-async def get_pnl():
-    """Return all P&L tracker entries with live mark-to-market."""
-    trades = load_pnl_tracker()
-    # Attach latest CE LTP from yfinance fast_info if available
-    # (lightweight — no NSE call needed for mark-to-market approximation)
-    return trades
-
-
-@app.post("/api/pnl/entry")
-async def add_pnl_entry(req: PnLEntryRequest):
-    """Record a new trade entry (sell CE position)."""
-    trades   = load_pnl_tracker()
-    trade_id = _make_trade_id(req.ticker, req.strike, req.expiry)
-
-    # Upsert — if trade exists, update; else append
-    existing = next((t for t in trades if t["trade_id"] == trade_id), None)
-    entry = {
-        "trade_id":       trade_id,
-        "ticker":         req.ticker.upper(),
-        "strike":         req.strike,
-        "expiry":         req.expiry,
-        "entry_ltp":      req.entry_ltp,
-        "lots":           req.lots,
-        "lot_size":       req.lot_size,
-        "notes":          req.notes or "",
-        "entry_time":     now_ist_str(),
-        "status":         "open",
-        "exit_ltp":       None,
-        "exit_time":      None,
-        "mtm_ltp":        req.entry_ltp,
-        "mtm_time":       now_ist_str(),
-        **_mtm_pnl(req.entry_ltp, req.entry_ltp, req.lots or 1, req.lot_size or 1),
-    }
-    if existing:
-        trades = [entry if t["trade_id"] == trade_id else t for t in trades]
-    else:
-        trades.append(entry)
-
-    save_pnl_tracker(trades)
-    return entry
-
-
-@app.put("/api/pnl/{trade_id}/mark")
-async def mark_pnl(trade_id: str, req: PnLMarkRequest):
-    """Update mark-to-market LTP for an open trade."""
-    trades = load_pnl_tracker()
-    trade  = next((t for t in trades if t["trade_id"] == trade_id), None)
-    if not trade:
-        raise HTTPException(404, "Trade not found")
-
-    trade["mtm_ltp"]  = req.current_ltp
-    trade["mtm_time"] = now_ist_str()
-    trade.update(_mtm_pnl(trade["entry_ltp"], req.current_ltp,
-                           trade.get("lots", 1), trade.get("lot_size", 1)))
-
-    save_pnl_tracker(trades)
-    return trade
-
-
-@app.put("/api/pnl/{trade_id}/close")
-async def close_pnl_trade(trade_id: str, req: PnLMarkRequest):
-    """Mark a trade as closed (bought back CE) and lock P&L."""
-    trades = load_pnl_tracker()
-    trade  = next((t for t in trades if t["trade_id"] == trade_id), None)
-    if not trade:
-        raise HTTPException(404, "Trade not found")
-
-    trade["exit_ltp"]  = req.current_ltp
-    trade["exit_time"] = now_ist_str()
-    trade["status"]    = "closed"
-    trade["mtm_ltp"]   = req.current_ltp
-    trade["mtm_time"]  = now_ist_str()
-    trade.update(_mtm_pnl(trade["entry_ltp"], req.current_ltp,
-                           trade.get("lots", 1), trade.get("lot_size", 1)))
-
-    save_pnl_tracker(trades)
-    return trade
-
-
-@app.delete("/api/pnl/{trade_id}")
-async def delete_pnl_trade(trade_id: str):
-    """Remove a trade from the tracker."""
-    trades = [t for t in load_pnl_tracker() if t["trade_id"] != trade_id]
-    save_pnl_tracker(trades)
-    return {"ok": True, "remaining": len(trades)}
-
-
-# ─────────────────────────────────────────────────────────────
-#  TRADE LOG — Paper Trading Journal for Chartink Prime Targets
-# ─────────────────────────────────────────────────────────────
-# Tracks simulated trades on Prime Target stocks. Each trade records:
-#   • Entry: ticker, price, date, quantity, target %, stop %, notes
-#   • Live: MTM P&L computed on-demand from yfinance current_price
-#   • Exit:  exit price, exit date, realized P&L, days held, hit_target
-#
-# Storage: trade_log.json (atomic writes via _wj → survives server restarts)
-# Polling: frontend refreshes MTM once per minute (no backend scheduler needed)
-#
-# Relationship to existing PnL tracker (/api/pnl/*):
-#   The PnL tracker is for SHORT CE option positions (real options trades).
-#   THIS trade log is for EQUITY paper-trading on Prime Target breakouts.
-#   They are intentionally separate — different instruments, different schemas.
-
-class TradeLogEntryRequest(BaseModel):
-    """Open a new paper trade on a Prime Target stock."""
-    ticker:        str
-    entry_price:   float
-    entry_date:    Optional[str] = None    # ISO date "YYYY-MM-DD", defaults to today IST
-    quantity:      Optional[int]   = 1
-    target_pct:    Optional[float] = 3.0   # % gain target (3% = classic EMA9 breakout target)
-    stop_pct:      Optional[float] = 0.0   # % stop loss (0 = no stop)
-    notes:         Optional[str]   = ""
-    # Snapshot of signal data at entry time — lets the trade log stand on
-    # its own even if the source signal later disappears from the screener.
-    signal_data:   Optional[Dict]  = None
-
-class TradeLogExitRequest(BaseModel):
-    """Close an open paper trade at the user-specified exit price."""
-    exit_price:    float
-    exit_date:     Optional[str] = None    # ISO date, defaults to today IST
-    notes:         Optional[str] = None    # optional exit notes appended to existing
-
-def _make_trade_id(ticker: str, entry_date: str) -> str:
-    """Stable ID: TICKER_YYYYMMDD_HHMMSS — collisions extremely unlikely
-    because the user opens trades one at a time via the modal."""
-    ts = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
-    return f"{ticker.upper()}_{entry_date.replace('-', '')}_{ts}"
-
-def _trade_log_compute_metrics(trade: Dict, current_price: Optional[float] = None) -> Dict:
-    """
-    Compute MTM P&L + progress-to-target for a single trade.
-    Pure function — does NOT mutate the input trade dict.
-    Used by GET /api/trade-log (for open trades) and at exit time.
-    """
-    entry_price = float(trade.get("entry_price", 0) or 0)
-    qty         = int(trade.get("quantity", 1) or 1)
-    target_pct  = float(trade.get("target_pct", 0) or 0)
-    stop_pct    = float(trade.get("stop_pct", 0) or 0)
-    status      = trade.get("status", "open")
-
-    if status == "closed":
-        # Realized metrics — use stored exit price
-        exit_price = float(trade.get("exit_price", 0) or 0)
-        pnl_amount = round((exit_price - entry_price) * qty, 2)
-        pnl_pct    = round((exit_price - entry_price) / entry_price * 100, 2) if entry_price > 0 else 0.0
-        target_price = round(entry_price * (1 + target_pct / 100), 2)
-        return {
-            "current_price":   exit_price,
-            "pnl_amount":      pnl_amount,
-            "pnl_pct":         pnl_pct,
-            "target_price":    target_price,
-            "progress_pct":    round(pnl_pct / target_pct * 100, 1) if target_pct > 0 else 0.0,
-            "hit_target":      bool(trade.get("hit_target", exit_price >= target_price if target_price else False)),
-            "hit_stop":        False,  # computed at exit time, stored on trade
-        }
-
-    # Open trade — MTM using current_price
-    cp = float(current_price) if current_price is not None else None
-    if cp is None or entry_price <= 0:
-        target_price = round(entry_price * (1 + target_pct / 100), 2) if target_pct else None
-        stop_price   = round(entry_price * (1 - stop_pct / 100), 2) if stop_pct else None
-        return {
-            "current_price":   None,
-            "pnl_amount":      None,
-            "pnl_pct":         None,
-            "target_price":    target_price,
-            "stop_price":      stop_price,
-            "progress_pct":    None,
-            "hit_target":      False,
-            "hit_stop":        False,
-        }
-
-    pnl_amount = round((cp - entry_price) * qty, 2)
-    pnl_pct    = round((cp - entry_price) / entry_price * 100, 2)
-    target_price = round(entry_price * (1 + target_pct / 100), 2) if target_pct else None
-    stop_price   = round(entry_price * (1 - stop_pct / 100), 2) if stop_pct else None
-    progress_pct = round(pnl_pct / target_pct * 100, 1) if target_pct > 0 else 0.0
-    return {
-        "current_price":   cp,
-        "pnl_amount":      pnl_amount,
-        "pnl_pct":         pnl_pct,
-        "target_price":    target_price,
-        "stop_price":      stop_price,
-        "progress_pct":    progress_pct,
-        "hit_target":      bool(target_price and cp >= target_price),
-        "hit_stop":        bool(stop_price and cp <= stop_price),
-    }
-
-
-@app.get("/api/trade-log")
-async def get_trade_log(status: Optional[str] = None):
-    """
-    List all paper trades. Optional ?status=open|closed filter.
-    For open trades, attaches MTM P&L computed from yfinance current_price
-    (one quick_info call per unique open ticker — typically <2s total).
-    """
-    data = load_trade_log()
-    trades = data.get("trades", []) if isinstance(data, dict) else []
-
-    # Filter by status if requested
-    if status in ("open", "closed"):
-        trades = [t for t in trades if t.get("status") == status]
-
-    # For open trades, fetch current prices in bulk (deduped tickers)
-    # so the frontend doesn't have to make N separate quick-scan calls.
-    open_tickers = list({t["ticker"] for t in trades
-                         if t.get("status") == "open" and t.get("ticker")})
-    price_cache: Dict[str, Optional[float]] = {}
-    if open_tickers:
-        for tk in open_tickers:
-            try:
-                # get_current_price uses yfinance fast_info — fast, no NSE call.
-                # Safe to call even when options toggle is OFF.
-                price_cache[tk] = get_current_price(tk)
-            except Exception as e:
-                print(f"[TradeLog] price fetch failed for {tk}: {e}")
-                price_cache[tk] = None
-
-    # Attach computed metrics to each trade
-    enriched = []
-    for t in trades:
-        cp = price_cache.get(t.get("ticker")) if t.get("status") == "open" else None
-        metrics = _trade_log_compute_metrics(t, cp)
-        enriched.append({**t, **metrics})
-
-    return {
-        "trades":    enriched,
-        "count":     len(enriched),
-        "open":      len([t for t in enriched if t.get("status") == "open"]),
-        "closed":    len([t for t in enriched if t.get("status") == "closed"]),
-    }
-
-
-@app.post("/api/trade-log/entry")
-async def open_trade_log_entry(req: TradeLogEntryRequest):
-    """Open a new paper trade on a Prime Target stock."""
-    ticker = req.ticker.strip().upper().replace(".NS", "").replace(".BO", "")
-    if not ticker:
-        raise HTTPException(400, "Ticker is required")
-    if req.entry_price <= 0:
-        raise HTTPException(400, "Entry price must be positive")
-
-    entry_date = req.entry_date or datetime.now(IST).strftime("%Y-%m-%d")
-    trade_id   = _make_trade_id(ticker, entry_date)
-
-    trade = {
-        "trade_id":     trade_id,
-        "ticker":       ticker,
-        "entry_price":  float(req.entry_price),
-        "entry_date":   entry_date,
-        "quantity":     int(req.quantity or 1),
-        "target_pct":   float(req.target_pct or 3.0),
-        "stop_pct":     float(req.stop_pct or 0.0),
-        "notes":        (req.notes or "").strip(),
-        "signal_data":  req.signal_data or None,
-        "status":       "open",
-        "exit_price":   None,
-        "exit_date":    None,
-        "pnl_amount":   None,
-        "pnl_pct":      None,
-        "days_held":    None,
-        "hit_target":   False,
-        "hit_stop":     False,
-        "created_at":   datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-        "updated_at":   datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-    data = load_trade_log()
-    if not isinstance(data, dict):
-        data = {"trades": []}
-    if "trades" not in data:
-        data["trades"] = []
-    data["trades"].append(trade)
-    save_trade_log(data)
-    print(f"[TradeLog] OPENED {trade_id} @ ₹{trade['entry_price']} "
-          f"target=+{trade['target_pct']}% qty={trade['quantity']}")
-    return {"ok": True, "trade": trade}
-
-
-@app.put("/api/trade-log/{trade_id}/exit")
-async def close_trade_log_entry(trade_id: str, req: TradeLogExitRequest):
-    """Close an open paper trade at the given exit price."""
-    if req.exit_price <= 0:
-        raise HTTPException(400, "Exit price must be positive")
-
-    data = load_trade_log()
-    trades = data.get("trades", []) if isinstance(data, dict) else []
-    trade = next((t for t in trades if t.get("trade_id") == trade_id), None)
-    if not trade:
-        raise HTTPException(404, f"Trade {trade_id} not found")
-    if trade.get("status") == "closed":
-        raise HTTPException(409, f"Trade {trade_id} is already closed")
-
-    exit_price = float(req.exit_price)
-    exit_date  = req.exit_date or datetime.now(IST).strftime("%Y-%m-%d")
-    entry_price = float(trade["entry_price"])
-    qty         = int(trade.get("quantity", 1))
-    target_pct  = float(trade.get("target_pct", 0))
-    stop_pct    = float(trade.get("stop_pct", 0))
-
-    # Realized P&L
-    pnl_amount = round((exit_price - entry_price) * qty, 2)
-    pnl_pct    = round((exit_price - entry_price) / entry_price * 100, 2) if entry_price > 0 else 0.0
-
-    # Days held (calendar days — simple and deterministic; the user's request
-    # says "how many days" without specifying trading days, so we use calendar
-    # days for transparency. Could be upgraded to trading days later.)
-    try:
-        entry_dt = datetime.strptime(trade["entry_date"], "%Y-%m-%d")
-        exit_dt  = datetime.strptime(exit_date, "%Y-%m-%d")
-        days_held = max((exit_dt - entry_dt).days, 0)
-    except Exception:
-        days_held = None
-
-    # Did we hit target / stop?
-    target_price = entry_price * (1 + target_pct / 100) if target_pct else None
-    stop_price   = entry_price * (1 - stop_pct / 100) if stop_pct else None
-    hit_target   = bool(target_price and exit_price >= target_price)
-    hit_stop     = bool(stop_price and exit_price <= stop_price)
-
-    # Append exit notes if provided
-    if req.notes:
-        existing_notes = trade.get("notes", "") or ""
-        trade["notes"] = (existing_notes + "\n[Exit] " + req.notes.strip()).strip()
-
-    trade.update({
-        "status":      "closed",
-        "exit_price":  exit_price,
-        "exit_date":   exit_date,
-        "pnl_amount":  pnl_amount,
-        "pnl_pct":     pnl_pct,
-        "days_held":   days_held,
-        "hit_target":  hit_target,
-        "hit_stop":    hit_stop,
-        "updated_at":  datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-    })
-    save_trade_log(data)
-    print(f"[TradeLog] CLOSED {trade_id} @ ₹{exit_price}  P&L ₹{pnl_amount} "
-          f"({pnl_pct}%)  days={days_held}  hit_target={hit_target}")
-    return {"ok": True, "trade": trade}
-
-
-@app.delete("/api/trade-log/{trade_id}")
-async def delete_trade_log_entry(trade_id: str, hard: bool = False):
-    """
-    Remove a trade from the log.
-    ?hard=false (default): keeps the trade but marks it as "deleted" —
-        useful if you want to keep history for audit but hide it from the UI.
-    ?hard=true: permanently removes the trade from trade_log.json.
-    """
-    data = load_trade_log()
-    trades = data.get("trades", []) if isinstance(data, dict) else []
-    if hard:
-        new_trades = [t for t in trades if t.get("trade_id") != trade_id]
-        if len(new_trades) == len(trades):
-            raise HTTPException(404, f"Trade {trade_id} not found")
-        data["trades"] = new_trades
-        save_trade_log(data)
-        print(f"[TradeLog] HARD-DELETED {trade_id}")
-        return {"ok": True, "remaining": len(new_trades), "action": "hard_delete"}
-    else:
-        trade = next((t for t in trades if t.get("trade_id") == trade_id), None)
-        if not trade:
-            raise HTTPException(404, f"Trade {trade_id} not found")
-        trade["status"]      = "deleted"
-        trade["updated_at"]  = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-        save_trade_log(data)
-        print(f"[TradeLog] SOFT-DELETED {trade_id}")
-        return {"ok": True, "action": "soft_delete", "trade": trade}
-
-
-@app.get("/api/trade-log/metrics")
-async def get_trade_log_metrics():
-    """
-    Aggregated stats across all closed trades:
-      • Win rate (closed trades with pnl_amount > 0 / total closed)
-      • Total realized P&L
-      • Avg days held (closed only)
-      • Avg days to target (closed trades that hit target)
-      • Best / worst trade
-      • Target hit rate (closed trades that hit target / total closed)
-    Open trades are listed separately with their MTM P&L.
-    """
-    data = load_trade_log()
-    trades = data.get("trades", []) if isinstance(data, dict) else []
-    closed = [t for t in trades if t.get("status") == "closed"]
-    open_  = [t for t in trades if t.get("status") == "open"]
-
-    # Fetch current prices for open trades to compute MTM
-    open_tickers = list({t["ticker"] for t in open_ if t.get("ticker")})
-    price_cache: Dict[str, Optional[float]] = {}
-    for tk in open_tickers:
-        try:
-            price_cache[tk] = get_current_price(tk)
-        except Exception:
-            price_cache[tk] = None
-
-    closed_pnls    = [float(t.get("pnl_amount", 0) or 0) for t in closed]
-    closed_days    = [t.get("days_held") for t in closed if t.get("days_held") is not None]
-    target_winners = [t for t in closed if t.get("hit_target")]
-    target_win_days= [t.get("days_held") for t in target_winners if t.get("days_held") is not None]
-
-    open_mtm = []
-    for t in open_:
-        cp = price_cache.get(t.get("ticker"))
-        m  = _trade_log_compute_metrics(t, cp)
-        open_mtm.append({**t, **m})
-
-    open_mtm_total = sum(m.get("pnl_amount") or 0 for m in open_mtm)
-
-    return {
-        "open_count":         len(open_),
-        "closed_count":       len(closed),
-        "win_count":          len([p for p in closed_pnls if p > 0]),
-        "loss_count":         len([p for p in closed_pnls if p < 0]),
-        "breakeven_count":    len([p for p in closed_pnls if p == 0]),
-        "win_rate_pct":       round(len([p for p in closed_pnls if p > 0]) / len(closed_pnls) * 100, 1) if closed_pnls else 0.0,
-        "total_realized_pnl": round(sum(closed_pnls), 2) if closed_pnls else 0.0,
-        "open_mtm_pnl":       round(open_mtm_total, 2),
-        "combined_pnl":       round(sum(closed_pnls) + open_mtm_total, 2),
-        "avg_days_held":      round(sum(closed_days) / len(closed_days), 1) if closed_days else 0.0,
-        "target_hit_count":   len(target_winners),
-        "target_hit_rate_pct": round(len(target_winners) / len(closed) * 100, 1) if closed else 0.0,
-        "avg_days_to_target": round(sum(target_win_days) / len(target_win_days), 1) if target_win_days else 0.0,
-        "best_trade_pnl":     max(closed_pnls) if closed_pnls else 0.0,
-        "worst_trade_pnl":    min(closed_pnls) if closed_pnls else 0.0,
-        "open_trades":        open_mtm,
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-#  FUNDAMENTAL FILTER — Piotroski-lite 5-check score per ticker
-# ─────────────────────────────────────────────────────────────
-# Goal: avoid stocks where the market is reacting to a real deterioration in
-# business quality (e.g. RBL Bank's asset quality, Syngene's margin
-# compression). The technical entry logic (FV + Resistance Gap + 9 EMA)
-# catches the price action, but cannot distinguish between sentiment-driven
-# drawdowns (recoverable) and fundamental deterioration (often permanent).
-#
-# 5 checks (each = 1 point, total 0-5):
-#   1. OCF > 0 (TTM operating cash flow, from cashflow statement)
-#   2. ROE ≥ 12% (return on equity, from yfinance info)
-#   3. Revenue Growth ≥ 0% YoY (latest quarter YoY, from info)
-#   4. Earnings Growth ≥ 0% YoY (proxy for margin trend)
-#   5. Debt-to-Equity < 1.0  (skipped/auto-passed for Financial sector)
-#
-# Verdicts:
-#   🟢 HEALTHY  = score 4-5  → safe to trade
-#   🟡 CAUTION  = score 3    → trade with care, investigate why
-#   🔴 AVOID    = score 0-2  → fundamental deterioration, skip
-#   ⚪ NO_DATA  = yfinance fetch failed
-#
-# Data source: yfinance (info dict + annual cashflow). One HTTP call per
-# ticker for info + one for cashflow. Cached to fundamentals_cache.json
-# (refreshed on-demand via the Fundamentals tab → "Refresh Now" button).
-# Data lags by 1-3 months (quarterly results); the filter is a rear-view
-# mirror, not a windshield.
-
-import csv as _csv_module
-
-# ── NaN/Infinity sanitizer ─────────────────────────────────────────────────
-# yfinance frequently returns float('nan') for missing fields (ROE, OCF, etc.)
-# when a stock's data is incomplete. FastAPI's JSONResponse uses
-# allow_nan=False, so any NaN value crashes the endpoint with:
-#   ValueError: Out of range float values are not JSON compliant: nan
-# This helper recursively walks a dict/list/float and converts NaN/Infinity
-# to None (which serializes to JSON null). Applied to every fundamentals
-# response so the issue can NEVER reoccur regardless of what yfinance returns.
-def _sanitize_nan(obj):
-    """Recursively convert NaN/Infinity floats to None. Handles dict/list/scalar."""
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return obj
-    if isinstance(obj, dict):
-        return {k: _sanitize_nan(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_nan(v) for v in obj]
-    return obj
-
-def _is_valid_number(v) -> bool:
-    """True only if v is a finite number (not None, not NaN, not Infinity).
-    Used by _compute_fundamental_score to decide whether a metric qualifies
-    for the score computation — yfinance returns NaN for missing fields, and
-    `nan is not None` returns True, so the existing `if x is not None:` guards
-    would silently treat NaN as 0-failing-the-check instead of N/A."""
-    if v is None:
-        return False
-    try:
-        f = float(v)
-        return not (math.isnan(f) or math.isinf(f))
-    except (TypeError, ValueError):
-        return False
-
-def load_master_tickers() -> List[Dict]:
-    """
-    Read the master tickers.csv. Returns list of {sr_no, security, symbol}.
-    Accepts CSVs with at least a SYMBOL column; SECURITY (company name) and
-    Sr. No. are preserved if present, so the exported CSV matches the user's
-    uploaded format exactly.
-    """
-    if not os.path.exists(TICKERS_FILE):
-        return []
-    rows = []
-    try:
-        with open(TICKERS_FILE, newline="", encoding="utf-8-sig") as f:
-            reader = _csv_module.DictReader(f)
-            for i, row in enumerate(reader, 1):
-                symbol = (row.get("SYMBOL") or row.get("Symbol") or row.get("symbol") or "").strip().upper()
-                if not symbol:
-                    continue
-                rows.append({
-                    "sr_no":   (row.get("Sr. No.") or row.get("Sr No") or str(i)).strip(),
-                    "security": (row.get("SECURITY") or row.get("Security") or row.get("Company") or symbol).strip(),
-                    "symbol":  symbol,
-                })
-    except Exception as e:
-        print(f"[Fundamentals] Failed to read {TICKERS_FILE}: {e}")
-    return rows
-
-
-def _fetch_yf_fundamentals(symbol: str) -> Dict:
-    """
-    Fetch fundamental metrics from yfinance for one Indian ticker.
-    Returns a dict of raw metrics (or {"error": ...} on failure).
-    All percentage/ratio fields are kept in their native yfinance units:
-      - roe, roa, operating_margins, profit_margins, revenue_growth,
-        earnings_growth: decimals (0.15 = 15%)
-      - debt_to_equity: percentage (50 = 0.5x)
-      - ocf_ttm: rupees (raw, will be normalized to ₹Cr in the UI)
-    """
-    yf_ticker = f"{symbol}.NS"
-    try:
-        t   = yf.Ticker(yf_ticker)
-        inf = t.info or {}
-        # Operating cash flow (TTM) — fetch from annual cashflow statement.
-        # yfinance returns this as a DataFrame with quarters/years as columns.
-        ocf_ttm = None
-        try:
-            cf = t.cashflow
-            if cf is not None and not cf.empty:
-                # Try common row labels across yfinance versions
-                for label in ("Total Cash From Operating Activities",
-                              "Operating Cash Flow",
-                              "Total Cash Flow From Operating Activities"):
-                    if label in cf.index:
-                        ocf_ttm = float(cf.loc[label].iloc[0])
-                        break
-        except Exception as _e_cf:
-            # Cashflow fetch failure is non-fatal — we still have info dict.
-            pass
-
-        return _sanitize_nan({
-            "symbol":           symbol,
-            "name":             inf.get("longName") or inf.get("shortName") or symbol,
-            "sector":           inf.get("sector") or "Unknown",
-            "industry":         inf.get("industry") or "Unknown",
-            "roe":              inf.get("returnOnEquity"),       # decimal
-            "roa":              inf.get("returnOnAssets"),
-            "debt_to_equity":   inf.get("debtToEquity"),          # percentage (50 = 0.5x)
-            "operating_margins": inf.get("operatingMargins"),     # decimal
-            "profit_margins":   inf.get("profitMargins"),
-            "revenue_growth":   inf.get("revenueGrowth"),         # decimal YoY
-            "earnings_growth":  inf.get("earningsGrowth"),        # decimal YoY
-            "ocf_ttm":          ocf_ttm,
-            "market_cap":       inf.get("marketCap"),
-            "fetched_at":       now_ist_str(),
-        })
-    except Exception as e:
-        return {"symbol": symbol, "error": str(e)[:200], "fetched_at": now_ist_str()}
-
-
-def _compute_fundamental_score(metrics: Dict) -> Dict:
-    """
-    Apply the 5-check Piotroski-lite score. Returns:
-      { score: 0-5, max_score: 5, verdict: '🟢'|'🟡'|'🔴'|'⚪', checks: [...] }
-    Each check entry: { name, passed: True|False|None, value, detail }
-    `passed=None` means data was unavailable; the check is excluded from the
-    denominator for verdict purposes but the score still caps at the count of
-    non-None checks.
-    """
-    if metrics.get("error"):
-        return {
-            "score":     None,
-            "max_score": 5,
-            "verdict":   "⚪ NO_DATA",
-            "checks":    [{"name": "Data fetch", "passed": False, "value": "Error",
-                           "detail": metrics.get("error", "")}],
-        }
-
-    checks = []
-    score  = 0
-
-    # Sector detection — financials get a different treatment for D/E.
-    sector    = metrics.get("sector") or ""
-    industry  = metrics.get("industry") or ""
-    is_financial = (sector == "Financial Services") or \
-                   ("Bank" in industry) or \
-                   ("Finance" in industry) or \
-                   ("Insurance" in industry)
-
-    # ── Check 1: OCF > 0 (TTM) ──────────────────────────────────────────────
-    # Catches profit-quality deterioration — PAT can be positive while OCF
-    # turns negative (working capital stretching, receivables ballooning).
-    # NOTE: _is_valid_number() handles the yfinance NaN case (missing data),
-    # which `ocf is not None` would NOT catch because float('nan') is not None.
-    ocf = metrics.get("ocf_ttm")
-    if _is_valid_number(ocf):
-        passed = ocf > 0
-        checks.append({
-            "name":   "OCF > 0 (TTM)",
-            "passed": passed,
-            "value":  f"₹{ocf/1e7:.1f}Cr" if abs(ocf) >= 1e7 else f"₹{ocf/1e5:.1f}L",
-            "detail": "Operating cash flow positive (TTM)" if passed else "OCF negative — profit-quality concern",
-        })
-        if passed: score += 1
-    else:
-        checks.append({"name": "OCF > 0 (TTM)", "passed": None, "value": "N/A",
-                       "detail": "Cashflow data unavailable"})
-
-    # ── Check 2: ROE ≥ 12% ──────────────────────────────────────────────────
-    # Filters out structurally low-return businesses that look "cheap" on P/E
-    # but never compound. 12% is a sector-neutral floor; IT/Pharma typically
-    # screen much higher, banks screen lower (use ROA there).
-    roe = metrics.get("roe")
-    if _is_valid_number(roe):
-        roe_pct = roe * 100
-        threshold = 8.0 if is_financial else 12.0   # banks: lower bar (ROE ~10-12% is healthy)
-        passed = roe_pct >= threshold
-        checks.append({
-            "name":   f"ROE ≥ {threshold:.0f}%" + (" (Financials floor)" if is_financial else ""),
-            "passed": passed,
-            "value":  f"{roe_pct:.1f}%",
-            "detail": f"Return on equity {'healthy' if passed else 'low — value-trap risk'}",
-        })
-        if passed: score += 1
-    else:
-        checks.append({"name": "ROE ≥ 12%", "passed": None, "value": "N/A",
-                       "detail": "ROE unavailable"})
-
-    # ── Check 3: Revenue Growth ≥ 0% YoY ────────────────────────────────────
-    # Catches shrinking-top-line situations (e.g. Syngene's slowing order book).
-    rg = metrics.get("revenue_growth")
-    if _is_valid_number(rg):
-        rg_pct = rg * 100
-        passed = rg_pct >= 0
-        checks.append({
-            "name":   "Revenue Growth ≥ 0% YoY",
-            "passed": passed,
-            "value":  f"{rg_pct:+.1f}%",
-            "detail": "Top-line growing" if passed else "Revenue shrinking — investigate",
-        })
-        if passed: score += 1
-    else:
-        checks.append({"name": "Revenue Growth ≥ 0% YoY", "passed": None, "value": "N/A",
-                       "detail": "Revenue growth unavailable"})
-
-    # ── Check 4: Earnings Growth ≥ 0% YoY ───────────────────────────────────
-    # Proxy for margin trend: if earnings are declining faster than revenue,
-    # margins are compressing (the Syngene pattern). If earnings are growing
-    # despite revenue softness, margins are expanding (positive operating leverage).
-    eg = metrics.get("earnings_growth")
-    if _is_valid_number(eg):
-        eg_pct = eg * 100
-        passed = eg_pct >= 0
-        checks.append({
-            "name":   "Earnings Growth ≥ 0% YoY",
-            "passed": passed,
-            "value":  f"{eg_pct:+.1f}%",
-            "detail": "Earnings growing" if passed else "Earnings declining — margin compression",
-        })
-        if passed: score += 1
-    else:
-        checks.append({"name": "Earnings Growth ≥ 0% YoY", "passed": None, "value": "N/A",
-                       "detail": "Earnings growth unavailable"})
-
-    # ── Check 5: D/E < 1.0 (auto-pass for Financials) ───────────────────────
-    # Catches leveraged balance sheets under stress. For banks/NBFCs, D/E is
-    # structurally different (deposits = liabilities) so the check is auto-passed
-    # and the user is told it was skipped.
-    if is_financial:
-        checks.append({
-            "name":   "D/E < 1.0 (Financial sector — auto-pass)",
-            "passed": True,
-            "value":  "N/A",
-            "detail": f"Skipped for {sector}/{industry} — D/E not meaningful for financials",
-        })
-        score += 1
-    else:
-        de = metrics.get("debt_to_equity")
-        if _is_valid_number(de):
-            # yfinance returns D/E as a percentage (e.g. 50 means 0.5x).
-            de_ratio = de / 100.0
-            passed = de_ratio < 1.0
-            checks.append({
-                "name":   "D/E < 1.0",
-                "passed": passed,
-                "value":  f"{de_ratio:.2f}x",
-                "detail": "Leverage manageable" if passed else "High leverage — stress risk",
-            })
-            if passed: score += 1
-        else:
-            checks.append({"name": "D/E < 1.0", "passed": None, "value": "N/A",
-                           "detail": "Balance sheet data unavailable"})
-
-    # ── Verdict ─────────────────────────────────────────────────────────────
-    # Thresholds: 4-5 = HEALTHY, 3 = CAUTION, 0-2 = AVOID
-    # (For tickers with partial data, we still apply the same thresholds —
-    # a low score on partial data is still a yellow flag.)
-    if score is None:
-        verdict = "⚪ NO_DATA"
-    elif score >= 4:
-        verdict = "🟢 HEALTHY"
-    elif score >= 3:
-        verdict = "🟡 CAUTION"
-    else:
-        verdict = "🔴 AVOID"
-
-    return {"score": score, "max_score": 5, "verdict": verdict, "checks": checks}
-
-
-def _run_fundamentals_filter_job(tickers: List[Dict], job_id: str):
-    """
-    Background worker: fetch yfinance fundamentals for every ticker in the
-    master list, compute the 5-check score, and save the full result set to
-    fundamentals_cache.json. Designed to run in asyncio.to_thread so it
-    doesn't block the FastAPI event loop.
-    """
-    total   = len(tickers)
-    results = []
-    for i, t in enumerate(tickers):
-        symbol = t["symbol"]
-        job_log(job_id, f"[{i+1}/{total}] Fetching {symbol}...", "info")
-        try:
-            metrics    = _fetch_yf_fundamentals(symbol)
-            score_data = _compute_fundamental_score(metrics)
-        except Exception as e:
-            metrics    = {"symbol": symbol, "error": str(e)[:200], "fetched_at": now_ist_str()}
-            score_data = {"score": None, "max_score": 5, "verdict": "⚪ NO_DATA",
-                          "checks": [{"name": "Data fetch", "passed": False, "value": "Error", "detail": str(e)[:200]}]}
-
-        results.append({
-            "sr_no":    t["sr_no"],
-            "security": t["security"],
-            "symbol":   symbol,
-            "metrics":  metrics,
-            "score":    score_data["score"],
-            "max_score": score_data["max_score"],
-            "verdict":  score_data["verdict"],
-            "checks":   score_data["checks"],
-        })
-        job_progress(job_id, i + 1, total, symbol)
-        # ── Be polite to yfinance — generous delay between requests ───────────
-        # User explicitly requested MORE delay to avoid rate-limit violations.
-        # Increased from 0.2-0.4s → 1.5-3.0s. For ~200 tickers this adds ~5-10
-        # min to the refresh time (total ~10-15 min instead of ~5 min), but
-        # stays well under yfinance's ~2000 req/hour per-IP soft limit.
-        # 2 yfinance calls per ticker (info + cashflow) × 200 tickers = 400 calls,
-        # spread over ~10-15 min = ~30-40 calls/min — comfortable margin.
-        if i < total - 1:
-            time.sleep(random.uniform(1.5, 3.0))
-
-    save_fundamentals({
-        "last_run_at":  now_ist_str(),
-        "tickers_path": TICKERS_FILE,
-        "total":        len(results),
-        "results":      results,
-    })
-    job_done(job_id, results)
-    return results
-
-
-@app.get("/api/fundamentals/status")
-async def get_fundamentals_status():
-    """Cache stats: last_run, total scanned, counts by verdict."""
-    cache = load_fundamentals()
-    results = cache.get("results", []) if isinstance(cache, dict) else []
-    counts = {"🟢 HEALTHY": 0, "🟡 CAUTION": 0, "🔴 AVOID": 0, "⚪ NO_DATA": 0}
-    for r in results:
-        v = r.get("verdict", "⚪ NO_DATA")
-        if v in counts: counts[v] += 1
-    return _sanitize_nan({
-        "last_run_at":   cache.get("last_run_at") if isinstance(cache, dict) else None,
-        "total":         len(results),
-        "counts":        counts,
-        "tickers_file":  TICKERS_FILE,
-        "tickers_count": len(load_master_tickers()),
-    })
-
-
-@app.get("/api/fundamentals/filter")
-async def get_fundamentals_filter(
-    score_min: Optional[int] = None,
-    score_max: Optional[int] = None,
+@app.get("/api/swing-reversal/scan")
+async def api_swing_reversal_scan(
+    min_upside: float = Query(15.0, ge=0, le=100),
+    max_dist_floor: float = Query(14.0, gt=0, le=50),
+    source: Literal["fno", "all"] = "fno",
 ):
+    return await _swing_scan(min_upside, max_dist_floor, source)
+
+
+async def _swing_scan(min_upside, max_dist_floor, source, progress=None):
     """
-    Return filtered tickers from the cache.
-
-    Filter modes (combinable):
-      • score_min=N     → only tickers with score >= N (HEALTHY list)
-      • score_max=N     → only tickers with score <= N (AVOID list, e.g. score_max=2)
-      • score_min=N score_max=M → range filter (N <= score <= M)
-      • neither passed  → all tickers with a valid score (excludes NO_DATA)
-
-    Default (no params) returns all tickers that have a score (0-5).
-    To include NO_DATA tickers (score=None), the frontend filters client-side
-    or a future include_no_data param can be added.
+    Scan universe for 15%+ major bottom reversal setups matching
+    patterns like TCS (~2000), HDFCBANK (~680), and INFY (~980).
     """
-    # Validate ranges
-    if score_min is not None and (score_min < 0 or score_min > 5):
-        raise HTTPException(400, "score_min must be between 0 and 5")
-    if score_max is not None and (score_max < 0 or score_max > 5):
-        raise HTTPException(400, "score_max must be between 0 and 5")
-    if score_min is not None and score_max is not None and score_min > score_max:
-        raise HTTPException(400, "score_min cannot be greater than score_max")
-
-    cache   = load_fundamentals()
-    results = cache.get("results", []) if isinstance(cache, dict) else []
-
-    filtered = []
-    for r in results:
-        score = r.get("score")
-        # Skip NO_DATA tickers (score is None) unless no filter is applied
-        if score is None:
-            continue
-        if score_min is not None and score < score_min:
-            continue
-        if score_max is not None and score > score_max:
-            continue
-        filtered.append(r)
-
-    # ── Critical: sanitize ALL NaN values before returning.
-    return _sanitize_nan({
-        "last_run_at": cache.get("last_run_at") if isinstance(cache, dict) else None,
-        "score_min":   score_min,
-        "score_max":   score_max,
-        "filtered":    len(filtered),
-        "total":       len(results),
-        "results":     filtered,
-    })
-
-
-@app.post("/api/fundamentals/refresh")
-async def refresh_fundamentals(background_tasks: BackgroundTasks):
-    """
-    Trigger a background refresh: fetch yfinance fundamentals for every
-    ticker in tickers.csv, recompute scores, save to cache.
-    Returns a job_id for SSE progress streaming via /api/jobs/{job_id}/stream.
-    """
-    tickers = load_master_tickers()
-    if not tickers:
-        raise HTTPException(400, f"No tickers found in {TICKERS_FILE}. "
-                                 "Upload a CSV via /api/tickers/upload first.")
-    job_id = create_job()
-    background_tasks.add_task(asyncio.to_thread,
-                              _run_fundamentals_filter_job, tickers, job_id)
-    return {"job_id": job_id, "total": len(tickers),
-            "message": f"Refreshing fundamentals for {len(tickers)} tickers in background"}
-
-
-@app.get("/api/fundamentals/export")
-async def export_fundamentals_csv(
-    score_min: Optional[int] = None,
-    score_max: Optional[int] = None,
-):
-    """
-    Export filtered tickers as CSV in the user's 3-column format:
-        Sr. No.,SECURITY,SYMBOL
-        1,ACC Limited,ACC
-        ...
-
-    Filter modes (same as /api/fundamentals/filter):
-      • score_min=N     → HEALTHY list (score >= N)
-      • score_max=N     → AVOID list (score <= N, e.g. score_max=2)
-      • both            → range filter
-      • neither         → all tickers with a valid score
-
-    The output is ready to upload to Chartink screener or Duration Backtest.
-    Filename reflects the filter mode:
-      • score_min=4  → fundamentals_healthy_score_min4_2026-06-26.csv
-      • score_max=2  → fundamentals_avoid_score_max2_2026-06-26.csv
-    """
-    # Validate ranges
-    if score_min is not None and (score_min < 0 or score_min > 5):
-        raise HTTPException(400, "score_min must be between 0 and 5")
-    if score_max is not None and (score_max < 0 or score_max > 5):
-        raise HTTPException(400, "score_max must be between 0 and 5")
-    if score_min is not None and score_max is not None and score_min > score_max:
-        raise HTTPException(400, "score_min cannot be greater than score_max")
-
-    cache   = load_fundamentals()
-    results = cache.get("results", []) if isinstance(cache, dict) else []
-
-    filtered = []
-    for r in results:
-        score = r.get("score")
-        if score is None:
-            continue
-        if score_min is not None and score < score_min:
-            continue
-        if score_max is not None and score > score_max:
-            continue
-        filtered.append(r)
-
-    # Build CSV in memory
-    output = io.StringIO()
-    output.write("\ufeff")  # BOM for Excel UTF-8 detection
-    writer = _csv_module.writer(output, lineterminator="\r\n")
-    writer.writerow(["Sr. No.", "SECURITY", "SYMBOL"])
-    for i, r in enumerate(filtered, 1):
-        sec = (r.get("metrics", {}) or {}).get("name") or r.get("security") or r.get("symbol", "")
-        writer.writerow([i, sec, r.get("symbol", "")])
-
-    csv_bytes = output.getvalue().encode("utf-8")
-
-    # Build descriptive filename based on filter mode
-    today_str = datetime.now(IST).strftime('%Y-%m-%d')
-    if score_min is not None and score_max is not None:
-        tag = f"range_{score_min}_to_{score_max}"
-    elif score_max is not None:
-        tag = f"avoid_score_max{score_max}"
-    elif score_min is not None:
-        tag = f"healthy_score_min{score_min}"
-    else:
-        tag = "all"
-    filename = f"fundamentals_{tag}_{today_str}.csv"
-
-    return Response(
-        content=csv_bytes,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    results = await asyncio.to_thread(
+        scan_swing_reversals,
+        min_upside_pct=min_upside,
+        max_dist_to_floor_pct=max_dist_floor,
+        source=source,
+        progress=progress,
     )
 
+    accumulation_count = sum(1 for r in results if r["alert_status"] == "ACCUMULATION_ZONE")
+    breakout_count = sum(1 for r in results if r["alert_status"] == "BREAKOUT_CONFIRMED")
+    approaching_count = sum(1 for r in results if r["alert_status"] == "APPROACHING_SUPPORT")
 
-@app.delete("/api/fundamentals/cache")
-async def clear_fundamentals_cache():
-    """Clear the fundamentals cache (forces next /refresh to re-fetch from scratch)."""
-    save_fundamentals({"results": []})
-    return {"ok": True, "message": "Fundamentals cache cleared"}
+    return {
+        "status": "SUCCESS",
+        "total_candidates": len(results),
+        "accumulation_count": accumulation_count,
+        "breakout_count": breakout_count,
+        "approaching_count": approaching_count,
+        "candidates": results,
+    }
 
 
-# ─────────────────────────────────────────────────────────────
-#  STARTUP
-# ─────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup_event():
-    cfg = load_config()
-    # ── Hydrate the in-memory options toggle from disk on boot ──────────────
-    # This ensures the toggle state from a previous session is respected,
-    # e.g. if the user disabled options yesterday and restarts the server today.
-    _refresh_options_enabled_from_config()
-    print(f"[STARTUP] Options processing = {'ENABLED' if _OPTIONS_ENABLED else 'DISABLED'} "
-          f"(loaded from config.json)")
-    # ── Hydrate the Chartink feed toggle from disk on boot ──────────────────
-    _refresh_chartink_feed_enabled_from_config()
-    print(f"[STARTUP] Chartink Live Feed = {'ENABLED' if _CHARTINK_FEED_ENABLED else 'DISABLED'} "
-          f"(loaded from config.json)")
-    if cfg.get("auto_scan_enabled"):
-        start_scheduler(cfg)
-    # ── Only start the Chartink auto-poller if the toggle is ON ─────────────
-    # When OFF, the scheduler doesn't start; the user can toggle it back ON
-    # via the header switch (PUT /api/chartink-feed/toggle) which calls
-    # start_chartink_scheduler() at runtime.
-    if _CHARTINK_FEED_ENABLED:
-        start_chartink_scheduler()   # auto-poll Chartink every 5 min
-    else:
-        print("[STARTUP] Chartink scheduler NOT started (toggle is OFF)")
-    # ── Near-Support scheduler — piggybacks on the Chartink toggle so the
-    #    user has a single "quiet time" switch for ALL auto-pollers.
-    if _CHARTINK_FEED_ENABLED:
-        start_near_support_scheduler()   # auto-poll near-support every 5 min
-        print("[STARTUP] Near-Support scheduler STARTED (5-min interval, piggybacks on Chartink feed toggle)")
-    else:
-        print("[STARTUP] Near-Support scheduler NOT started (Chartink feed toggle is OFF)")
+@app.get("/api/swing-reversal/chart/{ticker}")
+async def api_swing_reversal_chart(ticker: str, lookback_days: int = Query(250, ge=80, le=3650)):
+    """
+    Get detailed candlestick and pattern layout data for plotting
+    the exact 15%+ bottom reversal chart pattern.
+    """
+    sym = normalize_ticker(ticker)
+    df = indicator_frame(await _load_completed_history(sym, max(365, lookback_days)))
+
+    # Pattern analysis
+    pattern_data = await asyncio.to_thread(
+        analyze_stock_swing_reversal,
+        sym,
+        df,
+        min_upside_pct=0.0,
+        max_dist_to_floor_pct=25.0,
+        lookback_days=lookback_days,
+        include_fair_value=False,
+    )
+
+    candles = []
+    for idx, row in df.iterrows():
+        d_str = str(idx.date()) if hasattr(idx, "date") else str(idx)[:10]
+        candles.append({
+            "time": d_str,
+            "open": round(float(row["Open"]), 2),
+            "high": round(float(row["High"]), 2),
+            "low": round(float(row["Low"]), 2),
+            "close": round(float(row["Close"]), 2),
+            "volume": int(row.get("Volume", 0)),
+            "ema9": round(float(row["ema9"]), 2) if not pd.isna(row["ema9"]) else None,
+            "sma50": round(float(row["sma50"]), 2) if not pd.isna(row["sma50"]) else None,
+        })
+
+    return {
+        "ticker": sym,
+        "candles": candles,
+        "pattern": pattern_data,
+        "current_price": float(df.Close.iloc[-1]),
+        "ema9": float(df.ema9.iloc[-1]),
+        "as_of": str(df.index[-1].date()),
+        "history_bars": len(df),
+        "data_source": df.attrs.get("data_source"),
+    }
+
+
+@app.get("/api/swing-reversal/alerts")
+async def api_swing_reversal_alerts():
+    """
+    Get live suggestions and alerts for stocks in the accumulation zone
+    or triggering a 9-EMA reversal off the major support floor.
+    """
+    results = await asyncio.to_thread(scan_swing_reversals, min_upside_pct=15.0)
+    alerts = []
+    for r in results:
+        if r["alert_status"] in ("ACCUMULATION_ZONE", "BREAKOUT_CONFIRMED"):
+            alerts.append({
+                "ticker": r["ticker"],
+                "alert_status": r["alert_status"],
+                "alert_label": r["alert_label"],
+                "floor_price": r["floor_price"],
+                "current_price": r["current_price"],
+                "dist_to_floor_pct": r["dist_to_floor_pct"],
+                "target_price": r["target_price"],
+                "target_gain_pct": r["target_gain_pct"],
+                "stop_loss_price": r["stop_loss_price"],
+                "pattern_type": r["pattern_type"],
+                "action": r["action_recommendation"],
+            })
+    return {"status": "SUCCESS", "alerts_count": len(alerts), "alerts": alerts}
+
+
+async def _job_screener(parameters, progress):
+    return await run_ema9_screener(**parameters, progress=progress)
+
+
+async def _job_recommended(parameters, progress):
+    return await _recommended_scan(**parameters, progress=progress)
+
+
+async def _job_swing(parameters, progress):
+    return await _swing_scan(**parameters, progress=progress)
+
+
+async def _job_backtest(parameters, progress):
+    return await run_equity_backtest(**parameters, progress=progress)
+
+
+async def _job_duration(parameters, progress):
+    return await run_duration_backtest(**parameters, progress=progress)
+
+
+register_job_handler("screener", ScreenerScanRequest, _job_screener)
+register_job_handler("recommended", RecommendedJobRequest, _job_recommended)
+register_job_handler("swing", SwingJobRequest, _job_swing)
+register_job_handler("backtest", BacktestRequest, _job_backtest)
+register_job_handler("duration", DurationBacktestRequest, _job_duration)
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-@app.on_event("shutdown")
-async def shutdown_near_support_scheduler():
-    """Graceful shutdown of the near-support auto-poller."""
-    try:
-        stop_near_support_scheduler()
-        print("[SHUTDOWN] Near-Support scheduler stopped")
-    except Exception as e:
-        print(f"[SHUTDOWN] Near-Support scheduler stop error: {e}")

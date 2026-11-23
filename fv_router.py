@@ -19,6 +19,7 @@ Mount this in main.py:
 
 import asyncio
 import datetime as dt_module
+import math
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -38,7 +39,7 @@ def _current_fy() -> int:
     """Return the current Indian financial year (Apr–Mar).
        e.g. April 2024 → FY 2024,  January 2024 → FY 2023
     """
-    today = dt_module.date.today()
+    today = dt_module.datetime.now(dt_module.timezone(dt_module.timedelta(hours=5, minutes=30))).date()
     return today.year if today.month >= 4 else today.year - 1
 
 
@@ -69,6 +70,7 @@ def _row_for_fy(result: dict, fy: int) -> dict:
 
     # ── TTM model — find last quarter inside this FY ──────────
     fair_t = r2_t = mp_t = 0.0
+    ttm_reference = None
     if result.get("has_ttm"):
         hist_t = result.get("ttm", {}).get("historical", {})
         # FY window: Apr 1 of `fy` → Mar 31 of `fy+1`
@@ -86,26 +88,39 @@ def _row_for_fy(result: dict, fy: int) -> dict:
                     fair_t    = row.get("fair", 0.0)
                     r2_t      = result.get("ttm", {}).get("r2", 0.0)
                     mp_t      = row.get("misprice_pct", 0.0)
+                    ttm_reference = row.get("actual")
 
     # ── Composite (weighted by R²) ────────────────────────────
     entries = []
-    if fair_op: entries.append((fair_op, max(0.1, r2_op), 1.0))
-    if fair_s:  entries.append((fair_s,  max(0.1, r2_s),  0.8))
-    if fair_t:  entries.append((fair_t,  max(0.1, r2_t),  1.2))
+    def valid(fair, r2, block, minimum):
+        return (isinstance(fair, (int, float)) and isinstance(r2, (int, float)) and
+                math.isfinite(fair) and fair > 0 and math.isfinite(r2) and 0.25 < r2 <= 1 and
+                block.get("sample_count", 0) >= minimum and block.get("slope", 0) > 0 and
+                block.get("positive_fundamentals") is True)
+    if valid(fair_op, r2_op, result.get("op", {}), 5): entries.append((fair_op, r2_op, 1.0))
+    if valid(fair_s, r2_s, result.get("sales", {}), 5): entries.append((fair_s, r2_s, 0.8))
+    if valid(fair_t, r2_t, result.get("ttm", {}), 8): entries.append((fair_t, r2_t, 1.2))
 
     composite = 0.0
     if entries:
         total_w   = sum(w * mw for _, w, mw in entries)
         composite = sum(f * w * mw for f, w, mw in entries) / total_w
 
-    current = result.get("current_price", 0.0)
-    comp_gain = round((composite - current) / current * 100, 1) if current else 0.0
+    # A historical FY row must be compared with that FY's actual close.
+    # Using today's close makes the historical bucket change every day.
+    reference = op_row.get("actual")
+    if not reference and result.get("has_sales"):
+        reference = result.get("sales", {}).get("historical", {}).get(fy_str, {}).get("actual")
+    if not reference:
+        reference = ttm_reference
+    comp_gain = round((composite - reference) / reference * 100, 1) if composite and reference else 0.0
 
     # Pick misprice relative to current price (Pine wants the gap, not historical)
     # For historical bars we use the OP misprice as representative
-    misprice = mp_op if fair_op else (mp_s if fair_s else mp_t)
+    misprice = round((reference - composite) / composite * 100, 1) if composite and reference else 0.0
 
     bucket = (
+        "NODATA" if not composite or not reference else
         "UNDERVALUED" if comp_gain > 15 else
         "OVERVALUED"  if comp_gain < -15 else
         "FAIR"
@@ -123,6 +138,9 @@ def _row_for_fy(result: dict, fy: int) -> dict:
         "bucket":    bucket,
         "misprice":  round(misprice,  1),
         "comp_gain": comp_gain,
+        "actual_price": reference,
+        "fit_scope": "RETROSPECTIVE_IN_SAMPLE",
+        "point_in_time_safe": False,
     }
 
 

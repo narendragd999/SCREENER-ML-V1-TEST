@@ -1,27 +1,18 @@
 @echo off
-title SCREENER SERVER
+title EQUITY 9-EMA & FAIR VALUE 3% SCREENER
 
-echo ======================================
-echo Killing processes using port 8000...
-echo ======================================
+echo ========================================================
+echo Starting Equity 9-EMA & Fair Value 3% Screener Platform
+echo ========================================================
 
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8000') do (
-    echo Killing PID %%a
-    taskkill /F /PID %%a >nul 2>&1
-)
+cd /d "%~dp0"
 
-
-timeout /t 2 /nobreak >nul
-
+echo Dashboard URL: http://localhost:8000
+echo API Docs:      http://localhost:8000/docs
 echo.
-echo ======================================
-echo Starting SCREENER...
-echo ======================================
 
-D:
-cd /d "E:\application\Office-Scripts\SCRIPTS\SCREENER-ML-V1-TEST-01"
-
-python main.py
-
+echo Keep this window open while using the dashboard.
+python -B -m uvicorn main:app --host 127.0.0.1 --port 8000
+if errorlevel 1 echo If port 8000 is already in use, open the running dashboard instead of starting a second copy.
 
 pause
